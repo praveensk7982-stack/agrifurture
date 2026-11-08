@@ -57,6 +57,15 @@ def create_app():
             "is_vercel": Config.IS_VERCEL
         })
 
+    @app.errorhandler(404)
+    def not_found(e):
+        from flask import request
+        return jsonify({
+            "error": "not found",
+            "path": request.path,
+            "full_path": request.full_path
+        }), 404
+
     return app
 
 # Top-level module Flask instance for Vercel WSGI entrypoint
