@@ -1,6 +1,5 @@
 Flask>=3.0.0
-flask-cors>=5.0.0
-python-dotenv>=1.0.0
-supabase>=2.6.0
 Werkzeug>=3.0.0
-gunicorn>=23.0.0
+supabase>=2.6.0
+python-dotenv>=1.0.0
+whitenoise>=6.6.0

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 80" preserveAspectRatio="none" width="100%" height="100%">
+  <defs>
+    <linearGradient id="hill1Grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#bbf7d0" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#86efac" stop-opacity="0.9"/>
+    </linearGradient>
+    <linearGradient id="hill2Grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4ade80" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#22c55e" stop-opacity="0.95"/>
+    </linearGradient>
+    <linearGradient id="hill3Grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#16a34a"/>
+      <stop offset="100%" stop-color="#15803d"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Distant Hill -->
+  <path d="M 0 50 Q 80 20, 180 45 T 300 35 L 300 80 L 0 80 Z" fill="url(#hill1Grad)"/>
+
+  <!-- Middle Field with subtle row lines -->
+  <path d="M 0 60 Q 110 30, 220 55 T 300 48 L 300 80 L 0 80 Z" fill="url(#hill2Grad)"/>
+  
+  <!-- Subtle agricultural furrows / ridges on the middle hill -->
+  <path d="M 0 68 Q 60 48, 140 65" stroke="#16a34a" stroke-width="1.5" stroke-opacity="0.4" fill="none"/>
+  <path d="M 10 74 Q 80 54, 170 70" stroke="#16a34a" stroke-width="1.5" stroke-opacity="0.4" fill="none"/>
+  <path d="M 25 79 Q 100 60, 200 76" stroke="#16a34a" stroke-width="1.5" stroke-opacity="0.4" fill="none"/>
+
+  <!-- Near Ridge on left -->
+  <path d="M 0 65 Q 60 52, 110 80 L 0 80 Z" fill="url(#hill3Grad)"/>
+
+  <!-- Little tree silhouettes on the ridge -->
+  <circle cx="18" cy="62" r="4" fill="#14532d"/>
+  <circle cx="24" cy="60" r="5" fill="#14532d"/>
+  <circle cx="31" cy="63" r="3.5" fill="#14532d"/>
+  <circle cx="160" cy="42" r="3" fill="#15803d" opacity="0.7"/>
+  <circle cx="165" cy="40" r="4" fill="#15803d" opacity="0.7"/>
+  <circle cx="260" cy="45" r="3.5" fill="#15803d" opacity="0.7"/>
+</svg>

@@ -101,15 +101,25 @@ def main():
     existing = db.get_user_by_email(email)
     if existing:
         print(f"Updating existing account '{email}' to Super Admin...")
-        conn = db._get_sqlite_conn()
-        try:
-            conn.execute(
-                "UPDATE profiles SET password_hash = ?, role = 'super_admin', status = 'active' WHERE email = ?",
-                (password_hash, email)
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        if db.use_supabase:
+            try:
+                db.client.table("profiles").update({
+                    "password_hash": password_hash,
+                    "role": "super_admin",
+                    "status": "active"
+                }).eq("email", email).execute()
+            except Exception as e:
+                print(f"[Supabase Admin Update Error] {e}")
+        if not db.use_supabase or not db.is_vercel:
+            conn = db._get_sqlite_conn()
+            try:
+                conn.execute(
+                    "UPDATE profiles SET password_hash = ?, role = 'super_admin', status = 'active' WHERE email = ?",
+                    (password_hash, email)
+                )
+                conn.commit()
+            finally:
+                conn.close()
         print(f"[OK] Successfully updated Super Admin account for {email}!")
     else:
         print(f"Creating new Super Admin profile for '{email}'...")

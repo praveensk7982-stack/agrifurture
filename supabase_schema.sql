@@ -17,6 +17,18 @@ CREATE TABLE IF NOT EXISTS profiles (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- 1.1 Email OTPs (Authentication & Password Reset)
+CREATE TABLE IF NOT EXISTS email_otps (
+    id BIGSERIAL PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    role VARCHAR(50) NOT NULL,
+    otp_hash VARCHAR(255) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    used INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- 2. Platform Commission & Financial Settings
 CREATE TABLE IF NOT EXISTS platform_settings (
     id INTEGER PRIMARY KEY DEFAULT 1,

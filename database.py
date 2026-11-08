@@ -12,8 +12,135 @@ try:
 except ImportError:
     HAS_SUPABASE_LIB = False
 
+
+class SupabaseOtpCursor:
+    def __init__(self, data=None, lastrowid=None):
+        self._data = data or []
+        self._index = 0
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        if self._index < len(self._data):
+            row = self._data[self._index]
+            self._index += 1
+            return row
+        return None
+
+    def fetchall(self):
+        remaining = self._data[self._index:]
+        self._index = len(self._data)
+        return remaining
+
+
+class SupabaseOtpConnection:
+    """
+    Proxy connection providing a SQLite-compatible interface for email_otps
+    routing directly to Supabase PostgreSQL in production without local filesystem writes.
+    """
+    def __init__(self, supabase_client, fallback_db_path=":memory:"):
+        self.client = supabase_client
+        self.fallback_db_path = fallback_db_path
+        self._fallback_conn = None
+
+    def _get_fallback(self):
+        if not self._fallback_conn:
+            self._fallback_conn = sqlite3.connect(self.fallback_db_path)
+            self._fallback_conn.row_factory = sqlite3.Row
+            self._fallback_conn.execute("""
+                CREATE TABLE IF NOT EXISTS email_otps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    otp_hash TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    used INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+            """)
+            self._fallback_conn.commit()
+        return self._fallback_conn
+
+    def execute(self, sql, params=()):
+        clean_sql = " ".join(sql.strip().split())
+        upper_sql = clean_sql.upper()
+
+        if "EMAIL_OTPS" in upper_sql and self.client:
+            try:
+                # 1. SELECT created_at
+                if upper_sql.startswith("SELECT CREATED_AT FROM EMAIL_OTPS"):
+                    query = self.client.table("email_otps").select("created_at").eq("email", params[0])
+                    if len(params) >= 3:
+                        query = query.eq("role", params[1]).gt("created_at", params[2])
+                    elif len(params) == 2:
+                        query = query.gt("created_at", params[1])
+                    res = query.order("id", desc=True).execute()
+                    rows = [dict(r) for r in (res.data or [])]
+                    return SupabaseOtpCursor(rows)
+
+                # 2. UPDATE email_otps SET used = 1
+                elif upper_sql.startswith("UPDATE EMAIL_OTPS SET USED = 1"):
+                    if "WHERE ID = ?" in upper_sql:
+                        self.client.table("email_otps").update({"used": 1}).eq("id", params[0]).execute()
+                    elif len(params) >= 2:
+                        self.client.table("email_otps").update({"used": 1}).eq("email", params[0]).eq("role", params[1]).eq("used", 0).execute()
+                    elif len(params) == 1:
+                        self.client.table("email_otps").update({"used": 1}).eq("email", params[0]).eq("used", 0).execute()
+                    return SupabaseOtpCursor()
+
+                # 3. UPDATE email_otps SET attempts = attempts + 1
+                elif upper_sql.startswith("UPDATE EMAIL_OTPS SET ATTEMPTS = ATTEMPTS + 1"):
+                    otp_id = params[0]
+                    res = self.client.table("email_otps").select("attempts").eq("id", otp_id).execute()
+                    att = (res.data[0].get("attempts") or 0) if res.data else 0
+                    self.client.table("email_otps").update({"attempts": att + 1}).eq("id", otp_id).execute()
+                    return SupabaseOtpCursor()
+
+                # 4. INSERT INTO email_otps
+                elif upper_sql.startswith("INSERT INTO EMAIL_OTPS"):
+                    payload = {
+                        "email": params[0],
+                        "role": params[1],
+                        "otp_hash": params[2],
+                        "expires_at": params[3],
+                        "created_at": params[4],
+                        "attempts": 0,
+                        "used": 0
+                    }
+                    res = self.client.table("email_otps").insert(payload).execute()
+                    last_id = res.data[0].get("id") if res.data else 1
+                    return SupabaseOtpCursor(lastrowid=last_id)
+
+                # 5. SELECT * FROM email_otps
+                elif upper_sql.startswith("SELECT * FROM EMAIL_OTPS"):
+                    query = self.client.table("email_otps").select("*").eq("email", params[0])
+                    if len(params) >= 2:
+                        query = query.eq("role", params[1])
+                    if "USED = 0" in upper_sql:
+                        query = query.eq("used", 0)
+                    res = query.order("id", desc=True).limit(1).execute()
+                    rows = [dict(r) for r in (res.data or [])]
+                    return SupabaseOtpCursor(rows)
+
+            except Exception as e:
+                print(f"[SupabaseOtpConnection] Falling back to memory: {e}")
+                return self._get_fallback().execute(sql, params)
+
+        return self._get_fallback().execute(sql, params)
+
+    def commit(self):
+        if self._fallback_conn:
+            self._fallback_conn.commit()
+
+    def close(self):
+        if self._fallback_conn:
+            self._fallback_conn.close()
+            self._fallback_conn = None
+
+
 class Database:
     def __init__(self):
+        self.is_vercel = bool(os.getenv("VERCEL"))
         self.client = None
         self.use_supabase = False
         
@@ -27,20 +154,33 @@ class Database:
                     self.use_supabase = True
                     print("[DATABASE] Successfully connected to live Supabase PostgreSQL project!")
             except Exception as e:
-                print(f"[DATABASE] Supabase direct connection warning: {e}. Utilizing embedded resilient engine with schema parity.")
-                self.use_supabase = False
+                print(f"[DATABASE] Supabase direct connection warning: {e}")
+                if self.is_vercel:
+                    self.use_supabase = True
+                else:
+                    self.use_supabase = False
+        elif self.is_vercel:
+            print("[DATABASE] Running on Vercel: Supabase URL and KEY required in Vercel environment variables.")
+            self.use_supabase = True
         
-        # Initialize SQLite fallback / mirror
-        self.db_path = Config.SQLITE_PATH
-        self._init_sqlite()
+        # Path for SQLite: memory only on Vercel, disk only locally in debug
+        self.db_path = ":memory:" if self.is_vercel else Config.SQLITE_PATH
+
+        # Initialize local SQLite ONLY if not on Vercel and in debug/local mode
+        if not self.is_vercel and (not self.use_supabase or os.getenv("FLASK_DEBUG") == "1"):
+            self._init_sqlite()
 
     def _get_sqlite_conn(self):
+        if self.use_supabase and self.client:
+            fallback = ":memory:" if self.is_vercel else self.db_path
+            return SupabaseOtpConnection(self.client, fallback)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _init_sqlite(self):
-        conn = self._get_sqlite_conn()
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         
         cur.executescript("""
@@ -56,16 +196,17 @@ class Database:
             avatar_url TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
         CREATE TABLE IF NOT EXISTS email_otps (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL,
-    role TEXT NOT NULL,
-    otp_hash TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    used INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
-);
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            role TEXT NOT NULL,
+            otp_hash TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS platform_settings (
             id INTEGER PRIMARY KEY DEFAULT 1,
@@ -173,7 +314,6 @@ class Database:
         conn.close()
 
     def _seed_sqlite(self, cur):
-        # Demo Users with real secure hashes (never $demo)
         default_hash = generate_password_hash("AgroPass123!")
         users = [
             ('22222222-2222-2222-2222-222222222222', 'farmer.rajesh@agrofuture.com', default_hash, 'Rajesh Patel (Greenfields Organics)', '+91 98765 00002', 'farmer', 'active', 'Nashik, Maharashtra', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150'),
@@ -182,7 +322,6 @@ class Database:
         ]
         cur.executemany("INSERT INTO profiles (id, email, password_hash, full_name, phone, role, status, location, avatar_url) VALUES (?,?,?,?,?,?,?,?,?)", users)
 
-        # Demo Products
         products = [
             ('a1111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 'Alphonso Ratnagiri Mangoes', 'fruits', 'Hapus A-Grade', 'GI-tagged naturally ripened sweet Alphonso mangoes fresh from Konkan coast orchards. Chemical-free.', 450.0, 'box', 85, 1, 'https://images.unsplash.com/photo-1553279768-865429fa0078?w=600', 'active'),
             ('a2222222-2222-2222-2222-222222222222', '22222222-2222-2222-2222-222222222222', 'Kinnow Nagpur Oranges', 'fruits', 'Juicy Sweet Citrus', 'Sweet, juicy fresh harvest oranges rich in Vitamin C, picked directly from farm orchards this morning.', 80.0, 'kg', 240, 0, 'https://images.unsplash.com/photo-1611080626919-7cf5a9dbab5b?w=600', 'active'),
@@ -196,7 +335,6 @@ class Database:
         ]
         cur.executemany("INSERT INTO products (id, farmer_id, title, category, variety, description, price_per_unit, unit, stock_quantity, is_organic, image_url, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", products)
 
-        # Demo Machinery
         machinery = [
             ('f1111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 'Mahindra 575 DI Heavy Tractor (45 HP)', 'tractor', '2023 Model, 4-Cylinder DI Engine', '45 HP, Dual Clutch, Hydrostatic Power Steering, Rotavator & Plough attachment ready. Fuel efficient.', 650.0, 4200.0, 'Coimbatore Agri Zone', 1, 150.0, 'https://images.unsplash.com/photo-1592878904946-b3cd8ae243d0?w=600', 1, 'active'),
             ('f2222222-2222-2222-2222-222222222222', '33333333-3333-3333-3333-333333333333', 'Kubota DC-68G Paddy Combine Harvester', 'harvester', 'Track Type High Speed Harvester', '68 HP turbo diesel, 2.0 meter cutter bar, grain tank 1200L, rubber crawlers for wet wetland paddies.', 1800.0, 12500.0, 'Thanjavur Delta Hub', 1, 250.0, 'https://images.unsplash.com/photo-1595838742456-424a73740263?w=600', 1, 'active'),
@@ -207,7 +345,6 @@ class Database:
         ]
         cur.executemany("INSERT INTO machinery (id, seller_id, title, category, model_info, specifications, hourly_rate, daily_rate, location, includes_operator, operator_charge_per_hour, image_url, is_available, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", machinery)
 
-        # Demo Order
         cur.execute("""
         INSERT INTO orders (id, order_number, customer_id, total_amount, total_commission, total_farmer_payout, shipping_address, contact_phone, payment_method, payment_status, status)
         VALUES ('01111111-1111-1111-1111-111111111111', 'ORD-2026-901', '44444444-4444-4444-4444-444444444444', 990.00, 49.50, 940.50, 'Green Valley Farmhouse, Sector 4, Pune 411045', '+91 98765 00004', 'upi', 'paid', 'confirmed')
@@ -219,7 +356,6 @@ class Database:
         ('0a222222-2222-2222-2222-222222222222', '01111111-1111-1111-1111-111111111111', 'b1111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 2.0, 45.00, 90.00, 4.50, 85.50)
         """)
 
-        # Demo Rental Booking
         cur.execute("""
         INSERT INTO rental_bookings (id, booking_number, customer_id, machinery_id, seller_id, rental_type, start_datetime, end_datetime, duration_units, rate_applied, with_operator, operator_fee, total_amount, commission_amount, seller_payout, delivery_location, notes, status, payment_status)
         VALUES ('0b111111-1111-1111-1111-111111111111', 'RN-2026-701', '44444444-4444-4444-4444-444444444444', 'f1111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 'hourly', '2026-09-12 09:00:00', '2026-09-12 14:00:00', 5.0, 650.00, 1, 750.00, 4000.00, 400.00, 3600.00, 'Survey Plot 88, Khed Shivapur, Pune', 'Need tractor for pre-monsoon rotavator ploughing.', 'approved', 'paid')
@@ -232,8 +368,11 @@ class Database:
                 res = self.client.table("profiles").select("*").eq("email", email).execute()
                 if res.data:
                     return res.data[0]
+                return None
             except Exception as e:
                 print(f"[DB] Supabase error in get_user_by_email: {e}")
+                if self.is_vercel:
+                    return None
         
         conn = self._get_sqlite_conn()
         user = conn.execute("SELECT * FROM profiles WHERE email = ?", (email,)).fetchone()
@@ -246,8 +385,11 @@ class Database:
                 res = self.client.table("profiles").select("*").eq("id", user_id).execute()
                 if res.data:
                     return res.data[0]
+                return None
             except Exception as e:
                 print(f"[DB] Supabase error in get_user_by_id: {e}")
+                if self.is_vercel:
+                    return None
 
         conn = self._get_sqlite_conn()
         user = conn.execute("SELECT * FROM profiles WHERE id = ?", (user_id,)).fetchone()
@@ -261,8 +403,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("profiles").insert(user_data).execute()
+                return user_data
             except Exception as e:
                 print(f"[DB] Supabase insert user: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         keys = list(user_data.keys())
@@ -280,9 +425,11 @@ class Database:
                 if role:
                     query = query.eq("role", role)
                 res = query.order("created_at", desc=True).execute()
-                return res.data
+                return res.data or []
             except Exception as e:
                 print(f"[DB] Supabase get_all_users: {e}")
+                if self.is_vercel:
+                    return []
 
         conn = self._get_sqlite_conn()
         if role:
@@ -296,8 +443,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("profiles").update({"status": status}).eq("id", user_id).execute()
+                return True
             except Exception as e:
                 print(f"[DB] Supabase update user status: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         conn.execute("UPDATE profiles SET status = ? WHERE id = ?", (status, user_id))
@@ -309,8 +459,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("profiles").update({"password_hash": password_hash}).eq("id", user_id).execute()
+                return True
             except Exception as e:
                 print(f"[DB] Supabase update user password: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         conn.execute("UPDATE profiles SET password_hash = ? WHERE id = ?", (password_hash, user_id))
@@ -327,6 +480,12 @@ class Database:
                     return res.data[0]
             except Exception as e:
                 print(f"[DB] Supabase get_platform_settings: {e}")
+                if self.is_vercel:
+                    return {
+                        "id": 1,
+                        "produce_commission_percent": Config.DEFAULT_PRODUCE_COMMISSION,
+                        "machinery_commission_percent": Config.DEFAULT_MACHINERY_COMMISSION
+                    }
 
         conn = self._get_sqlite_conn()
         row = conn.execute("SELECT * FROM platform_settings WHERE id = 1").fetchone()
@@ -349,8 +508,11 @@ class Database:
                     "machinery_commission_percent": machinery_comm,
                     "updated_at": now
                 }).execute()
+                return self.get_platform_settings()
             except Exception as e:
                 print(f"[DB] Supabase update settings: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         conn.execute("""
@@ -375,9 +537,8 @@ class Database:
                     query = query.eq("status", status)
                 res = query.order("created_at", desc=True).execute()
                 
-                # Transform joined profiles
                 items = []
-                for item in res.data:
+                for item in (res.data or []):
                     if "profiles" in item and item["profiles"]:
                         item["farmer_name"] = item["profiles"].get("full_name", "")
                         item["farmer_location"] = item["profiles"].get("location", "")
@@ -388,6 +549,8 @@ class Database:
                 return items
             except Exception as e:
                 print(f"[DB] Supabase get_products: {e}")
+                if self.is_vercel:
+                    return []
 
         conn = self._get_sqlite_conn()
         sql = """
@@ -424,8 +587,11 @@ class Database:
                     if "profiles" in item and item["profiles"]:
                         item["farmer_name"] = item["profiles"].get("full_name", "")
                     return item
+                return None
             except Exception as e:
                 print(f"[DB] Supabase get_product_by_id: {e}")
+                if self.is_vercel:
+                    return None
 
         conn = self._get_sqlite_conn()
         row = conn.execute("""
@@ -444,8 +610,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("products").insert(product_data).execute()
+                return product_data
             except Exception as e:
                 print(f"[DB] Supabase insert product: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         keys = list(product_data.keys())
@@ -460,8 +629,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("products").update(updates).eq("id", product_id).execute()
+                return True
             except Exception as e:
                 print(f"[DB] Supabase update product: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
@@ -475,8 +647,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("products").delete().eq("id", product_id).execute()
+                return True
             except Exception as e:
                 print(f"[DB] Supabase delete product: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
@@ -498,7 +673,7 @@ class Database:
                 res = query.order("created_at", desc=True).execute()
 
                 items = []
-                for item in res.data:
+                for item in (res.data or []):
                     if "profiles" in item and item["profiles"]:
                         item["seller_name"] = item["profiles"].get("full_name", "")
                         item["seller_phone"] = item["profiles"].get("phone", "")
@@ -509,6 +684,8 @@ class Database:
                 return items
             except Exception as e:
                 print(f"[DB] Supabase get_machinery: {e}")
+                if self.is_vercel:
+                    return []
 
         conn = self._get_sqlite_conn()
         sql = """
@@ -545,8 +722,11 @@ class Database:
                         item["seller_name"] = item["profiles"].get("full_name", "")
                         item["seller_phone"] = item["profiles"].get("phone", "")
                     return item
+                return None
             except Exception as e:
                 print(f"[DB] Supabase get_machinery_by_id: {e}")
+                if self.is_vercel:
+                    return None
 
         conn = self._get_sqlite_conn()
         row = conn.execute("""
@@ -565,8 +745,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("machinery").insert(machinery_data).execute()
+                return machinery_data
             except Exception as e:
                 print(f"[DB] Supabase insert machinery: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         keys = list(machinery_data.keys())
@@ -581,8 +764,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("machinery").update(updates).eq("id", machinery_id).execute()
+                return True
             except Exception as e:
                 print(f"[DB] Supabase update machinery: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
@@ -596,8 +782,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("machinery").delete().eq("id", machinery_id).execute()
+                return True
             except Exception as e:
                 print(f"[DB] Supabase delete machinery: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         conn.execute("DELETE FROM machinery WHERE id = ?", (machinery_id,))
@@ -610,7 +799,6 @@ class Database:
         order_id = order_data.get("id") or str(uuid.uuid4())
         order_data["id"] = order_id
         
-        # Insert order
         if self.use_supabase:
             try:
                 self.client.table("orders").insert(order_data).execute()
@@ -619,13 +807,15 @@ class Database:
                     if "id" not in it:
                         it["id"] = str(uuid.uuid4())
                     self.client.table("order_items").insert(it).execute()
-                    # Decrement product stock
                     prod = self.client.table("products").select("stock_quantity").eq("id", it["product_id"]).execute()
                     if prod.data:
                         new_stock = max(0, float(prod.data[0]["stock_quantity"]) - float(it["quantity"]))
                         self.client.table("products").update({"stock_quantity": new_stock}).eq("id", it["product_id"]).execute()
+                return order_data
             except Exception as e:
                 print(f"[DB] Supabase create_order: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         cur = conn.cursor()
@@ -657,22 +847,20 @@ class Database:
                 res = query.order("created_at", desc=True).execute()
 
                 orders = []
-                for o in res.data:
+                for o in (res.data or []):
                     if "profiles" in o and o["profiles"]:
                         o["customer_name"] = o["profiles"].get("full_name", "")
                         o["customer_phone"] = o["profiles"].get("phone", "")
                     
-                    # Fetch items
                     items_res = self.client.table("order_items").select("*, products:product_id(title, unit, image_url)").eq("order_id", o["id"]).execute()
                     o_items = []
-                    for it in items_res.data:
+                    for it in (items_res.data or []):
                         if "products" in it and it["products"]:
                             it["product_title"] = it["products"].get("title", "")
                             it["product_image"] = it["products"].get("image_url", "")
                             it["unit"] = it["products"].get("unit", "kg")
                         o_items.append(it)
 
-                    # If filtering by farmer_id, only keep if farmer has an item in this order
                     if farmer_id:
                         farmer_items = [it for it in o_items if it.get("farmer_id") == farmer_id]
                         if not farmer_items:
@@ -685,6 +873,8 @@ class Database:
                 return orders
             except Exception as e:
                 print(f"[DB] Supabase get_orders: {e}")
+                if self.is_vercel:
+                    return []
 
         conn = self._get_sqlite_conn()
         sql = """
@@ -729,8 +919,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("orders").update({"status": status}).eq("id", order_id).execute()
+                return True
             except Exception as e:
                 print(f"[DB] Supabase update order status: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
@@ -746,8 +939,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("rental_bookings").insert(booking_data).execute()
+                return booking_data
             except Exception as e:
                 print(f"[DB] Supabase insert booking: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         keys = list(booking_data.keys())
@@ -769,7 +965,7 @@ class Database:
                 res = query.order("created_at", desc=True).execute()
 
                 items = []
-                for b in res.data:
+                for b in (res.data or []):
                     if "profiles" in b and b["profiles"]:
                         b["customer_name"] = b["profiles"].get("full_name", "")
                         b["customer_phone"] = b["profiles"].get("phone", "")
@@ -781,6 +977,8 @@ class Database:
                 return items
             except Exception as e:
                 print(f"[DB] Supabase get_bookings: {e}")
+                if self.is_vercel:
+                    return []
 
         conn = self._get_sqlite_conn()
         sql = """
@@ -811,8 +1009,11 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("rental_bookings").update({"status": status}).eq("id", booking_id).execute()
+                return True
             except Exception as e:
                 print(f"[DB] Supabase update booking status: {e}")
+                if self.is_vercel:
+                    raise e
 
         conn = self._get_sqlite_conn()
         conn.execute("UPDATE rental_bookings SET status = ? WHERE id = ?", (status, booking_id))
@@ -822,6 +1023,71 @@ class Database:
 
     # ------------------ Super Admin Metrics & Ledger ------------------
     def get_admin_metrics(self):
+        if self.use_supabase:
+            try:
+                profiles_res = self.client.table("profiles").select("role").execute()
+                prof_data = profiles_res.data or []
+                customers = sum(1 for p in prof_data if p.get("role") == "customer")
+                farmers = sum(1 for p in prof_data if p.get("role") == "farmer")
+                sellers = sum(1 for p in prof_data if p.get("role") == "machinery_seller")
+
+                products_res = self.client.table("products").select("id").execute()
+                total_products = len(products_res.data or [])
+
+                machinery_res = self.client.table("machinery").select("id").execute()
+                total_machinery = len(machinery_res.data or [])
+
+                orders_res = self.client.table("orders").select("total_amount, total_commission").execute()
+                ord_data = orders_res.data or []
+                total_orders = len(ord_data)
+                produce_sales = sum(float(o.get("total_amount") or 0) for o in ord_data)
+                produce_comm = sum(float(o.get("total_commission") or 0) for o in ord_data)
+
+                bookings_res = self.client.table("rental_bookings").select("total_amount, commission_amount").execute()
+                book_data = bookings_res.data or []
+                total_bookings = len(book_data)
+                machinery_rental = sum(float(b.get("total_amount") or 0) for b in book_data)
+                machinery_comm = sum(float(b.get("commission_amount") or 0) for b in book_data)
+
+                total_turnover = produce_sales + machinery_rental
+                total_admin_comm = produce_comm + machinery_comm
+
+                return {
+                    "total_platform_turnover": round(total_turnover, 2),
+                    "total_admin_commission": round(total_admin_comm, 2),
+                    "produce_sales_volume": round(produce_sales, 2),
+                    "produce_commission_earned": round(produce_comm, 2),
+                    "machinery_rental_volume": round(machinery_rental, 2),
+                    "machinery_commission_earned": round(machinery_comm, 2),
+                    "total_customers": customers,
+                    "total_farmers": farmers,
+                    "total_sellers": sellers,
+                    "total_users": customers + farmers + sellers + 1,
+                    "total_products": total_products,
+                    "total_machinery": total_machinery,
+                    "total_orders": total_orders,
+                    "total_bookings": total_bookings
+                }
+            except Exception as e:
+                print(f"[DB] Supabase get_admin_metrics: {e}")
+                if self.is_vercel:
+                    return {
+                        "total_platform_turnover": 0.0,
+                        "total_admin_commission": 0.0,
+                        "produce_sales_volume": 0.0,
+                        "produce_commission_earned": 0.0,
+                        "machinery_rental_volume": 0.0,
+                        "machinery_commission_earned": 0.0,
+                        "total_customers": 0,
+                        "total_farmers": 0,
+                        "total_sellers": 0,
+                        "total_users": 1,
+                        "total_products": 0,
+                        "total_machinery": 0,
+                        "total_orders": 0,
+                        "total_bookings": 0
+                    }
+
         conn = self._get_sqlite_conn()
         cur = conn.cursor()
 
