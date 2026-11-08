@@ -1,19 +1,23 @@
-from flask import Blueprint, request, jsonify, session
+from flask import Blueprint, request, jsonify
 from database import db
+from routes.auth_routes import role_required
 
 admin_bp = Blueprint("admin_bp", __name__)
 
 @admin_bp.route("/api/admin/metrics", methods=["GET"])
+@role_required("super_admin")
 def get_metrics():
     metrics = db.get_admin_metrics()
     return jsonify({"metrics": metrics})
 
 @admin_bp.route("/api/admin/commission-settings", methods=["GET"])
+@role_required("super_admin")
 def get_commission_settings():
     settings = db.get_platform_settings()
     return jsonify({"settings": settings})
 
 @admin_bp.route("/api/admin/commission-settings", methods=["PUT"])
+@role_required("super_admin")
 def update_commission_settings():
     data = request.get_json() or {}
     try:
@@ -32,6 +36,7 @@ def update_commission_settings():
     })
 
 @admin_bp.route("/api/admin/users", methods=["GET"])
+@role_required("super_admin")
 def list_users():
     role = request.args.get("role")
     users = db.get_all_users(role=role)
@@ -39,6 +44,7 @@ def list_users():
     return jsonify({"users": safe_users, "count": len(safe_users)})
 
 @admin_bp.route("/api/admin/users/<user_id>/status", methods=["PATCH"])
+@role_required("super_admin")
 def toggle_user_status(user_id):
     data = request.get_json() or {}
     status = data.get("status", "active")
@@ -49,6 +55,7 @@ def toggle_user_status(user_id):
     return jsonify({"message": f"User status set to '{status}'."})
 
 @admin_bp.route("/api/admin/transactions", methods=["GET"])
+@role_required("super_admin")
 def list_transactions():
     orders = db.get_orders()
     bookings = db.get_bookings()

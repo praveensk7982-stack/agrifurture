@@ -40,10 +40,16 @@ const API = {
     getMe() {
       return API.request("/api/auth/me");
     },
-    login(email, password) {
+    login(arg1, arg2, arg3) {
+      let body;
+      if (typeof arg1 === "object" && arg1 !== null) {
+        body = arg1;
+      } else {
+        body = { email: arg1, password: arg2, role: arg3 };
+      }
       return API.request("/api/auth/login", {
         method: "POST",
-        body: { email, password }
+        body
       });
     },
     register(userData) {
@@ -52,13 +58,43 @@ const API = {
         body: userData
       });
     },
+    signupSendOtp(data) {
+      return API.request("/api/auth/signup/send-otp", {
+        method: "POST",
+        body: data
+      });
+    },
+    signupVerifyOtp(data) {
+      return API.request("/api/auth/signup/verify-otp", {
+        method: "POST",
+        body: data
+      });
+    },
+    adminLoginStep1(data) {
+      return API.request("/api/auth/admin/verify-credentials", {
+        method: "POST",
+        body: data
+      });
+    },
+    adminLoginStep2(data) {
+      return API.request("/api/auth/admin/verify-otp", {
+        method: "POST",
+        body: data
+      });
+    },
     logout() {
       return API.request("/api/auth/logout", { method: "POST" });
     },
-    switchDemoRole(role) {
-      return API.request("/api/auth/switch-demo-role", {
+    forgotPasswordSendOtp(email) {
+      return API.request("/api/auth/forgot-password/send-otp", {
         method: "POST",
-        body: { role }
+        body: { email }
+      });
+    },
+    forgotPasswordReset(data) {
+      return API.request("/api/auth/forgot-password/reset", {
+        method: "POST",
+        body: data
       });
     }
   },

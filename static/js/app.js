@@ -18,35 +18,90 @@ const AppState = {
 // ===================================================================
 // AUTH STATE  — tracks who is logged in to which panel
 // ===================================================================
+// AUTH STATE & ROLE CONFIGURATION
+// ===================================================================
 const AuthState = {
-  // Each panel has its own login session (email/name + role)
+  // Each panel has its own active session
   sessions: {
     customer: null,
     farmer: null,
     machinery_seller: null,
     super_admin: null
+  }
+};
+
+const ROLE_CONFIG = {
+  customer: {
+    name: "Customer",
+    titleName: "User",
+    signupTitle: "Create User Account",
+    signupSubtitle: "Join the direct-from-farm produce marketplace",
+    loginTitle: "User Panel Login",
+    loginSubtitle: "Sign in to buy produce & rent machinery",
+    placeholderName: "Anita Sharma",
+    icon: "🛍️"
   },
-  // Admin credentials (hardcoded)
-  ADMIN_USERNAME: "Agrofuture",
-  ADMIN_PASSWORD: "agrofuture@1540"
+  farmer: {
+    name: "Farmer",
+    titleName: "Farmer",
+    signupTitle: "Create Farmer Account",
+    signupSubtitle: "List your harvests & connect with buyers directly",
+    loginTitle: "Farmer Panel Login",
+    loginSubtitle: "Sign in to manage your crops, orders & earnings",
+    placeholderName: "Rajesh Patel",
+    icon: "👨‍🌾"
+  },
+  machinery_seller: {
+    name: "Machinery Provider",
+    titleName: "Seller",
+    signupTitle: "Create Seller Account",
+    signupSubtitle: "List your agricultural fleet & earn rental income",
+    loginTitle: "Seller Panel Login",
+    loginSubtitle: "Sign in to manage your equipment & bookings",
+    placeholderName: "Suresh Kumar",
+    icon: "🚜"
+  },
+  super_admin: {
+    name: "Super Admin",
+    titleName: "Admin",
+    loginTitle: "Admin Panel Login",
+    loginSubtitle: "Restricted access — Admin credentials & 2FA required",
+    icon: "👑"
+  }
+};
+
+// State trackers for multi-step flows
+const SignupState = {
+  customer: { step: 1, full_name: "", email: "", phone: "", otp: "" },
+  farmer: { step: 1, full_name: "", email: "", phone: "", otp: "" },
+  machinery_seller: { step: 1, full_name: "", email: "", phone: "", otp: "" }
+};
+
+let AdminLoginState = {
+  email: "",
+  step: 1
 };
 
 // ===================================================================
-// AUTH MODAL HELPERS
+// AUTH MODAL HELPERS & VIEW SWITCHER
 // ===================================================================
 function openAuthModal(role) {
   const modal = document.getElementById(`authModal-${role}`);
   if (modal) {
-    // Reset errors & inputs
-    const errEl = document.getElementById(`authError-${role}`);
-    if (errEl) { errEl.style.display = "none"; errEl.textContent = ""; }
+    switchAuthView(role, "login");
     modal.classList.add("active");
   }
 }
 
 function closeAuthModal(role) {
   const modal = document.getElementById(`authModal-${role}`);
-  if (modal) modal.classList.remove("active");
+  if (modal) {
+    modal.classList.remove("active");
+    modal.querySelectorAll(".auth-error-msg").forEach(el => {
+      el.style.display = "none";
+      el.textContent = "";
+    });
+  }
 }
 
 // Close auth modal when clicking overlay background
@@ -56,16 +111,580 @@ document.addEventListener("click", (e) => {
   }
 });
 
+function switchAuthView(role, view) {
+  const modal = document.getElementById(`authModal-${role}`);
+  if (!modal) return;
+
+  // Toggle active view container
+  modal.querySelectorAll(".auth-view").forEach(v => v.classList.remove("active"));
+  const targetView = document.getElementById(`authView-${view}-${role}`);
+  if (targetView) targetView.classList.add("active");
+
+  // Reset errors in this modal
+  modal.querySelectorAll(".auth-error-msg").forEach(el => {
+    el.style.display = "none";
+    el.textContent = "";
+  });
+
+  // Reset forgot password sub-steps (Step 1 visible, Step 2 hidden)
+  const step1 = document.getElementById(`authForgotStep1-${role}`);
+  const step2 = document.getElementById(`authForgotStep2-${role}`);
+  if (step1) step1.style.display = "block";
+  if (step2) step2.style.display = "none";
+
+  // Reset admin 2-step login if super_admin
+  if (role === "super_admin") {
+    handleAdminBackToStep1();
+  }
+
+  // If entering registration, render reusable 3-step signup component (Step 1)
+  if (view === "register" && role !== "super_admin") {
+    SignupState[role] = { step: 1, full_name: "", email: "", phone: "", otp: "" };
+    renderSignupComponent(role, 1);
+  }
+
+  // Update modal title & subtitle based on role & active view
+  const titleEl = document.getElementById(`authTitle-${role}`);
+  const subtitleEl = document.getElementById(`authSubtitle-${role}`);
+  const cfg = ROLE_CONFIG[role] || {};
+
+  if (titleEl && subtitleEl) {
+    if (view === "login") {
+      titleEl.textContent = cfg.loginTitle || `${cfg.titleName || role} Panel Login`;
+      subtitleEl.textContent = cfg.loginSubtitle || "Sign in with your email & password";
+    } else if (view === "register") {
+      titleEl.textContent = cfg.signupTitle || `Create ${cfg.titleName || role} Account`;
+      subtitleEl.textContent = cfg.signupSubtitle || `Sign up for your personalized dashboard`;
+    } else if (view === "forgot") {
+      titleEl.textContent = `Reset ${cfg.titleName || role} Password`;
+      subtitleEl.textContent = "Enter your email to receive a 6-digit OTP verification code";
+    }
+  }
+}
+
 // ===================================================================
-// REQUEST PANEL ACCESS — called by all panel buttons & landing cards
+// REUSABLE 3-STEP SIGNUP COMPONENT (Step 1 -> Step 2 -> Step 3)
+// One function for all public roles (customer, farmer, machinery_seller)
 // ===================================================================
-function requestPanelAccess(role) {
-  // If already logged in for this panel, just switch to it
+function renderSignupComponent(role, step = 1, direction = "right") {
+  if (role === "super_admin") return; // Super admin has no signup
+
+  const container = document.getElementById(`authView-register-${role}`);
+  if (!container) return;
+
+  const cfg = ROLE_CONFIG[role] || {
+    titleName: formatRole(role),
+    placeholderName: "Your Full Name"
+  };
+  const state = SignupState[role] || { step: 1, full_name: "", email: "", phone: "", otp: "" };
+  state.step = step;
+
+  const slideClass = direction === "left" ? "slide-in-left" : "slide-in-right";
+
+  // Step Indicators (Dots 1, 2, 3)
+  const dot1Class = step === 1 ? "active" : "done";
+  const line1Class = step > 1 ? "done" : "";
+  const dot2Class = step === 2 ? "active" : (step > 2 ? "done" : "");
+  const line2Class = step > 2 ? "done" : "";
+  const dot3Class = step === 3 ? "active" : "";
+
+  let stepHtml = "";
+
+  if (step === 1) {
+    // STEP 1: Personal Details
+    stepHtml = `
+      <form onsubmit="handleSignupStep1(event, '${role}')">
+        <div class="auth-modal-body ${slideClass}">
+          <div class="auth-step-indicator">
+            <div class="auth-step-dot ${dot1Class}">1</div>
+            <div class="auth-step-line ${line1Class}"></div>
+            <div class="auth-step-dot ${dot2Class}">2</div>
+            <div class="auth-step-line ${line2Class}"></div>
+            <div class="auth-step-dot ${dot3Class}">3</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="authSignupName-${role}">Full Name</label>
+            <input type="text" id="authSignupName-${role}" class="form-control" placeholder="${cfg.placeholderName}" value="${state.full_name || ''}" required autocomplete="name">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="authSignupEmail-${role}">Email Address</label>
+            <input type="email" id="authSignupEmail-${role}" class="form-control" placeholder="yourname@gmail.com" value="${state.email || ''}" required autocomplete="email">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="authSignupPhone-${role}">Phone Number <span style="font-weight:normal; color:var(--text-light);">(optional)</span></label>
+            <input type="tel" id="authSignupPhone-${role}" class="form-control" placeholder="+91 98765 43210" value="${state.phone || ''}" autocomplete="tel">
+          </div>
+          <div class="auth-error-msg" id="authError-signup-${role}" style="display:none;"></div>
+          <button type="submit" class="btn-primary auth-submit-btn">
+            📩 Send Verification Code &rarr;
+          </button>
+          <div class="auth-switch-link-wrapper">
+            <a href="javascript:void(0)" class="auth-switch-link" onclick="switchAuthView('${role}', 'login')">
+              Already have an account? Sign in &rarr;
+            </a>
+          </div>
+        </div>
+      </form>
+    `;
+  } else if (step === 2) {
+    // STEP 2: 6-Digit OTP Verification
+    stepHtml = `
+      <form onsubmit="handleSignupStep2(event, '${role}')">
+        <div class="auth-modal-body ${slideClass}">
+          <div class="auth-step-indicator">
+            <div class="auth-step-dot ${dot1Class}">✓</div>
+            <div class="auth-step-line ${line1Class}"></div>
+            <div class="auth-step-dot ${dot2Class}">2</div>
+            <div class="auth-step-line ${line2Class}"></div>
+            <div class="auth-step-dot ${dot3Class}">3</div>
+          </div>
+          <div class="auth-otp-badge">🔒 Step 2: Verify Your Email</div>
+          <p style="font-size:0.84rem; color:var(--text-secondary); margin-bottom:12px;">
+            A 6-digit verification code was sent to <strong>${state.email}</strong>.
+          </p>
+          <div class="form-group">
+            <label class="form-label" for="authSignupOtp-${role}">Verification Code</label>
+            <input type="text" id="authSignupOtp-${role}" class="form-control auth-code-input" placeholder="123456" maxlength="6" pattern="\\d{6}" required autofocus>
+          </div>
+          <div class="auth-sublink-row" style="margin-bottom:12px;">
+            <a href="javascript:void(0)" class="auth-forgot-link" onclick="handleSignupResendOtp('${role}')">Resend code</a>
+            <a href="javascript:void(0)" class="auth-forgot-link" onclick="handleSignupBack('${role}', 1)">&larr; Change email</a>
+          </div>
+          <div class="auth-error-msg" id="authError-signup-${role}" style="display:none;"></div>
+          <button type="submit" class="btn-primary auth-submit-btn">
+            Verify Code &amp; Continue &rarr;
+          </button>
+        </div>
+      </form>
+    `;
+  } else if (step === 3) {
+    // STEP 3: Password Creation
+    stepHtml = `
+      <form onsubmit="handleSignupStep3(event, '${role}')">
+        <div class="auth-modal-body ${slideClass}">
+          <div class="auth-step-indicator">
+            <div class="auth-step-dot ${dot1Class}">✓</div>
+            <div class="auth-step-line ${line1Class}"></div>
+            <div class="auth-step-dot ${dot2Class}">✓</div>
+            <div class="auth-step-line ${line2Class}"></div>
+            <div class="auth-step-dot ${dot3Class}">3</div>
+          </div>
+          <div class="auth-otp-badge" style="background:#f0fdf4; color:#15803d; border-color:#bbf7d0;">✨ Step 3: Secure Your Account</div>
+          <div class="form-group">
+            <label class="form-label" for="authSignupPass-${role}">Create Password</label>
+            <div class="auth-password-wrapper">
+              <input type="password" id="authSignupPass-${role}" class="form-control" placeholder="Min. 8 chars (letters + numbers)" required autocomplete="new-password" oninput="validateLiveSignupPass('${role}')">
+              <button type="button" class="auth-eye-btn" onclick="toggleAuthPassword('authSignupPass-${role}', this)">👁️</button>
+            </div>
+            <div class="auth-hint">Must be at least 8 characters with both letters &amp; numbers</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="authSignupConf-${role}">Confirm Password</label>
+            <div class="auth-password-wrapper">
+              <input type="password" id="authSignupConf-${role}" class="form-control" placeholder="Re-enter password" required autocomplete="new-password" oninput="validateLiveSignupPass('${role}')">
+              <button type="button" class="auth-eye-btn" onclick="toggleAuthPassword('authSignupConf-${role}', this)">👁️</button>
+            </div>
+          </div>
+          <div class="auth-error-msg" id="authError-signup-${role}" style="display:none;"></div>
+          <button type="submit" class="btn-primary auth-submit-btn">
+            ✨ Complete Registration &amp; Sign In
+          </button>
+          <div class="auth-switch-link-wrapper">
+            <a href="javascript:void(0)" class="auth-switch-link" onclick="switchAuthView('${role}', 'login')">
+              Cancel
+            </a>
+          </div>
+        </div>
+      </form>
+    `;
+  }
+
+  container.innerHTML = stepHtml;
+}
+
+// Signup Step 1: Send OTP
+async function handleSignupStep1(event, role) {
+  event.preventDefault();
+  const nameEl  = document.getElementById(`authSignupName-${role}`);
+  const emailEl = document.getElementById(`authSignupEmail-${role}`);
+  const phoneEl = document.getElementById(`authSignupPhone-${role}`);
+  const errEl   = document.getElementById(`authError-signup-${role}`);
+
+  const full_name = nameEl ? nameEl.value.trim() : "";
+  const email     = emailEl ? emailEl.value.trim().toLowerCase() : "";
+  const phone     = phoneEl ? phoneEl.value.trim() : "";
+
+  if (!full_name || !email) {
+    if (errEl) { errEl.textContent = "Full name and email are required."; errEl.style.display = "block"; }
+    return;
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    if (errEl) { errEl.textContent = "Please enter a valid email address."; errEl.style.display = "block"; }
+    return;
+  }
+
+  const btn = event.target.querySelector("button[type='submit']");
+  const origText = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.innerHTML = "⏳ Sending OTP..."; }
+
+  try {
+    const res = await API.auth.signupSendOtp({ email, role });
+    SignupState[role] = { step: 2, full_name, email, phone, otp: "" };
+    renderSignupComponent(role, 2, "right");
+    showToast(res.message || "6-digit verification code sent to your email!", "info");
+  } catch (err) {
+    showAuthError(role, err.message || "Failed to send code. Please try again.", `authSignupEmail-${role}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = origText; }
+  }
+}
+
+// Signup Step 2: Verify OTP
+async function handleSignupStep2(event, role) {
+  event.preventDefault();
+  const otpEl = document.getElementById(`authSignupOtp-${role}`);
+  const errEl = document.getElementById(`authError-signup-${role}`);
+  const otp = otpEl ? otpEl.value.trim() : "";
+  const email = SignupState[role].email;
+
+  if (!otp || !/^\d{6}$/.test(otp)) {
+    showAuthError(role, "Please enter the 6-digit verification code.", `authSignupOtp-${role}`);
+    return;
+  }
+
+  const btn = event.target.querySelector("button[type='submit']");
+  const origText = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.innerHTML = "⏳ Verifying..."; }
+
+  try {
+    const res = await API.auth.signupVerifyOtp({ email, role, otp });
+    SignupState[role].otp = otp;
+    SignupState[role].step = 3;
+    renderSignupComponent(role, 3, "right");
+    showToast(res.message || "Email verified! Set your password to complete setup.", "success");
+  } catch (err) {
+    showAuthError(role, err.message || "Invalid or expired OTP.", `authSignupOtp-${role}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = origText; }
+  }
+}
+
+async function handleSignupResendOtp(role) {
+  const email = SignupState[role].email;
+  const errEl = document.getElementById(`authError-signup-${role}`);
+  try {
+    const res = await API.auth.signupSendOtp({ email, role });
+    showToast(res.message || "New verification code sent!", "info");
+    if (errEl) errEl.style.display = "none";
+  } catch (err) {
+    showAuthError(role, err.message || "Could not resend code.", `authSignupEmail-${role}`);
+  }
+}
+
+function handleSignupBack(role, toStep) {
+  renderSignupComponent(role, toStep, "left");
+}
+
+function validateLiveSignupPass(role) {
+  const passEl = document.getElementById(`authSignupPass-${role}`);
+  const confEl = document.getElementById(`authSignupConf-${role}`);
+  const errEl  = document.getElementById(`authError-signup-${role}`);
+  if (!errEl) return true;
+
+  const pass = passEl ? passEl.value : "";
+  const conf = confEl ? confEl.value : "";
+
+  if (pass) {
+    if (pass.length < 8) {
+      errEl.textContent = "Password must be at least 8 characters long.";
+      errEl.style.display = "block";
+      return false;
+    }
+    if (!/[A-Za-z]/.test(pass) || !/[0-9]/.test(pass)) {
+      errEl.textContent = "Password must contain both letters and numbers.";
+      errEl.style.display = "block";
+      return false;
+    }
+  }
+  if (conf && pass && conf !== pass) {
+    errEl.textContent = "Passwords do not match.";
+    errEl.style.display = "block";
+    return false;
+  }
+  errEl.textContent = "";
+  errEl.style.display = "none";
+  return true;
+}
+
+// Signup Step 3: Set Password & Create Account
+async function handleSignupStep3(event, role) {
+  event.preventDefault();
+  const passEl = document.getElementById(`authSignupPass-${role}`);
+  const confEl = document.getElementById(`authSignupConf-${role}`);
+  const errEl  = document.getElementById(`authError-signup-${role}`);
+
+  const password = passEl ? passEl.value : "";
+  const confirm  = confEl ? confEl.value : "";
+  const state    = SignupState[role];
+
+  if (!password || !confirm) {
+    showAuthError(role, "Please enter and confirm your password.", `authSignupPass-${role}`);
+    return;
+  }
+  if (password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+    showAuthError(role, "Password must be at least 8 characters with letters & numbers.", `authSignupPass-${role}`);
+    return;
+  }
+  if (password !== confirm) {
+    showAuthError(role, "Passwords do not match.", `authSignupConf-${role}`);
+    return;
+  }
+
+  const btn = event.target.querySelector("button[type='submit']");
+  const origText = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.innerHTML = "⏳ Creating account..."; }
+
+  try {
+    const res = await API.auth.register({
+      full_name: state.full_name,
+      email: state.email,
+      phone: state.phone,
+      password,
+      role,
+      otp: state.otp
+    });
+
+    const user = res.user || { id: null, email: state.email, full_name: state.full_name, role };
+    AuthState.sessions[role] = {
+      id: user.id,
+      email: user.email,
+      name: user.full_name,
+      role: user.role,
+      loginTime: new Date()
+    };
+    AppState.currentUser = user;
+
+    showAuthSuccess(role, "Account Created!", `Welcome to ${formatRole(role)} panel!`, () => {
+      closeAuthModal(role);
+      showToast(`🎉 Account created! Welcome to ${formatRole(role)} panel, ${user.full_name}!`, "success");
+      switchToPanel(role);
+    });
+  } catch (err) {
+    showAuthError(role, err.message || "Registration failed.", `authSignupPass-${role}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = origText; }
+  }
+}
+
+// ===================================================================
+// PUBLIC LOGIN: Customer / Farmer / Machinery Seller
+// ===================================================================
+async function handlePanelLogin(event, role) {
+  event.preventDefault();
+
+  const emailEl    = document.getElementById(`authEmail-${role}`);
+  const passwordEl = document.getElementById(`authPassword-${role}`);
+
+  const email    = emailEl ? emailEl.value.trim() : "";
+  const password = passwordEl ? passwordEl.value : "";
+
+  if (!email || !password) {
+    showAuthError(role, "Please enter your email and password.");
+    return;
+  }
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    showAuthError(role, "Please enter a valid email address.");
+    return;
+  }
+
+  const submitBtn = event.target.querySelector("button[type='submit']");
+  const origBtnText = submitBtn ? submitBtn.innerHTML : "";
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = "⏳ Signing in...";
+  }
+
+  try {
+    const res = await API.auth.login({ email, password, role });
+    const user = res.user || { id: null, email, full_name: email.split("@")[0], role };
+
+    AuthState.sessions[role] = {
+      id: user.id,
+      email: user.email,
+      name: user.full_name,
+      role: user.role,
+      loginTime: new Date()
+    };
+    AppState.currentUser = user;
+
+    showAuthSuccess(role, "Welcome Back!", `Accessing ${formatRole(role)} panel...`, () => {
+      closeAuthModal(role);
+      showToast(`✅ Welcome back, ${user.full_name}!`, "success");
+      switchToPanel(role);
+    });
+  } catch (err) {
+    showAuthError(role, err.message || "Invalid email or password.", `authPassword-${role}`);
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = origBtnText;
+    }
+  }
+}
+
+// ===================================================================
+// ADMIN 2-STEP LOGIN (Step 1: Credentials -> Step 2: Email OTP)
+// ===================================================================
+async function handleAdminLoginStep1(event) {
+  event.preventDefault();
+  const emailEl    = document.getElementById("adminEmail");
+  const passwordEl = document.getElementById("adminPassword");
+
+  const email    = emailEl ? emailEl.value.trim().toLowerCase() : "";
+  const password = passwordEl ? passwordEl.value : "";
+
+  if (!email || !password) {
+    showAuthError("super_admin", "Please enter admin email and password.");
+    return;
+  }
+
+  const btn = document.getElementById("adminStep1Btn");
+  const origText = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.innerHTML = "⏳ Verifying..."; }
+
+  try {
+    const res = await API.auth.adminLoginStep1({ email, password });
+    AdminLoginState = { email, step: 2 };
+
+    // Advance to Step 2 with smooth slide-in
+    const step1El = document.getElementById("adminLoginStep1");
+    const step2El = document.getElementById("adminLoginStep2");
+    if (step1El) step1El.style.display = "none";
+    if (step2El) {
+      step2El.style.display = "block";
+      step2El.classList.remove("slide-in-right", "slide-in-left");
+      void step2El.offsetWidth;
+      step2El.classList.add("slide-in-right");
+    }
+
+    const emailDisp = document.getElementById("adminOtpEmailDisplay");
+    if (emailDisp) emailDisp.textContent = email;
+
+    const otpInput = document.getElementById("adminOtp");
+    if (otpInput) { otpInput.value = ""; otpInput.focus(); }
+
+    const subtitle = document.getElementById("authSubtitle-super_admin");
+    if (subtitle) subtitle.textContent = "Enter the 6-digit authorization code sent to your email";
+
+    showToast("Authorization code sent to your admin email!", "info");
+  } catch (err) {
+    showAuthError("super_admin", err.message || "Invalid email or password.", "adminPassword");
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = origText; }
+  }
+}
+
+async function handleAdminLoginStep2(event) {
+  event.preventDefault();
+  const otpEl = document.getElementById("adminOtp");
+  const errEl = document.getElementById("authError-otp-super_admin");
+  const otp = otpEl ? otpEl.value.trim() : "";
+  const email = AdminLoginState.email;
+
+  if (!otp || !/^\d{6}$/.test(otp)) {
+    showAuthError("super_admin", "Please enter the 6-digit authorization code.", "adminOtp");
+    return;
+  }
+
+  const btn = document.getElementById("adminStep2Btn");
+  const origText = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.innerHTML = "⏳ Authenticating..."; }
+
+  try {
+    const res = await API.auth.adminLoginStep2({ email, otp });
+    const user = res.user || { id: null, email, full_name: "Super Admin", role: "super_admin" };
+
+    AuthState.sessions["super_admin"] = {
+      id: user.id,
+      email: user.email,
+      name: user.full_name,
+      role: "super_admin",
+      loginTime: new Date()
+    };
+    AppState.currentUser = user;
+
+    showAuthSuccess("super_admin", "Admin Verified!", "Welcome to Super Admin Dashboard...", () => {
+      closeAuthModal("super_admin");
+      showToast(`👑 Admin access granted — Welcome, ${user.full_name}!`, "success");
+      switchToPanel("super_admin");
+    });
+  } catch (err) {
+    showAuthError("super_admin", err.message || "Invalid or expired authorization code.", "adminOtp");
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = origText; }
+  }
+}
+
+async function handleAdminResendOtp() {
+  const email = AdminLoginState.email;
+  const passwordEl = document.getElementById("adminPassword");
+  const password = passwordEl ? passwordEl.value : "";
+  const errEl = document.getElementById("authError-otp-super_admin");
+  try {
+    await API.auth.adminLoginStep1({ email, password });
+    showToast("New authorization code sent!", "info");
+    if (errEl) errEl.style.display = "none";
+  } catch (err) {
+    showAuthError("super_admin", err.message || "Failed to resend authorization code.", "adminOtp");
+  }
+}
+
+function handleAdminBackToStep1() {
+  AdminLoginState.step = 1;
+  const step1 = document.getElementById("adminLoginStep1");
+  const step2 = document.getElementById("adminLoginStep2");
+  if (step2) step2.style.display = "none";
+  if (step1) {
+    step1.style.display = "block";
+    step1.classList.remove("slide-in-right", "slide-in-left");
+    void step1.offsetWidth;
+    step1.classList.add("slide-in-left");
+  }
+  const subtitle = document.getElementById("authSubtitle-super_admin");
+  if (subtitle) subtitle.textContent = "Restricted access — Admin credentials required";
+}
+
+// ===================================================================
+// REQUEST PANEL ACCESS
+// ===================================================================
+async function requestPanelAccess(role) {
+  // If already logged in locally for this panel, switch directly
   if (AuthState.sessions[role]) {
     switchToPanel(role);
     return;
   }
-  // Otherwise open the login modal
+
+  // Check if active backend session matches this role
+  try {
+    const me = await API.auth.getMe();
+    if (me && me.authenticated && me.user && me.user.role === role) {
+      AuthState.sessions[role] = {
+        id: me.user.id,
+        email: me.user.email,
+        name: me.user.full_name,
+        role: me.user.role,
+        loginTime: new Date()
+      };
+      AppState.currentUser = me.user;
+      switchToPanel(role);
+      return;
+    }
+  } catch (e) {
+    // Session check error or unauthenticated
+  }
+
+  // Otherwise open authentication modal
   openAuthModal(role);
 }
 
@@ -78,11 +697,11 @@ function switchToPanel(role) {
   // Hide all panels
   document.querySelectorAll(".panel-view").forEach(el => el.classList.remove("active"));
 
-  // Show the target panel
+  // Show target panel
   const panelEl = document.getElementById(`panel-${role}`);
   if (panelEl) panelEl.classList.add("active");
 
-  // Update top-bar button states
+  // Update top-bar state
   updateTopBarState(role);
 
   // Load panel data
@@ -93,7 +712,6 @@ function switchToPanel(role) {
 }
 
 function updateTopBarState(activeRole) {
-  // Update role buttons active/locked/unlocked state
   document.querySelectorAll(".role-btn[data-role]").forEach(btn => {
     const r = btn.dataset.role;
     btn.classList.remove("active", "locked", "unlocked");
@@ -106,21 +724,21 @@ function updateTopBarState(activeRole) {
     }
   });
 
-  // Show/hide logout button and update label
   const logoutBtn = document.getElementById("globalLogoutBtn");
   const labelEl   = document.getElementById("panelBarLabel");
   const session   = AuthState.sessions[activeRole];
 
   if (activeRole !== "landing" && session) {
+    document.body.classList.remove("on-landing");
     if (logoutBtn) logoutBtn.style.display = "";
     const panelNames = { customer: "User", farmer: "Farmer", machinery_seller: "Seller", super_admin: "Admin" };
     if (labelEl) labelEl.textContent = `${panelNames[activeRole] || ""} Panel — Signed in as ${session.name}`;
   } else {
+    document.body.classList.add("on-landing");
     if (logoutBtn) logoutBtn.style.display = "none";
     if (labelEl) labelEl.textContent = "SELECT YOUR PANEL:";
   }
 
-  // Update header user display
   if (session) {
     const nameEl = document.getElementById("headerUserName");
     const roleEl = document.getElementById("headerUserRole");
@@ -132,13 +750,19 @@ function updateTopBarState(activeRole) {
 // ===================================================================
 // LOGOUT
 // ===================================================================
-function logoutCurrentPanel() {
+async function logoutCurrentPanel() {
   const role = AppState.currentRole;
+  try {
+    await API.auth.logout();
+  } catch (e) {
+    console.warn("Logout error:", e);
+  }
+
   if (role && role !== "landing") {
     AuthState.sessions[role] = null;
     showToast(`Signed out of ${formatRole(role)} panel`, "info");
   }
-  // Return to landing
+  AppState.currentUser = null;
   AppState.currentRole = "landing";
   document.querySelectorAll(".panel-view").forEach(el => el.classList.remove("active"));
   const landingEl = document.getElementById("panel-landing");
@@ -147,93 +771,93 @@ function logoutCurrentPanel() {
 }
 
 // ===================================================================
-// HANDLE LOGIN: Customer / Farmer / Seller panels
+// FORGOT PASSWORD VIA OTP (purpose="reset")
+// Available for all roles
 // ===================================================================
-async function handlePanelLogin(event, role) {
+async function handleSendResetOtp(event, role) {
   event.preventDefault();
 
-  const emailEl    = document.getElementById(`authEmail-${role}`);
-  const passwordEl = document.getElementById(`authPassword-${role}`);
-  const errEl      = document.getElementById(`authError-${role}`);
+  const emailEl = document.getElementById(`authForgotEmail-${role}`);
+  const errEl   = document.getElementById(`authError-forgot-${role}`);
+  const email   = emailEl ? emailEl.value.trim().toLowerCase() : "";
 
-  const email    = emailEl ? emailEl.value.trim() : "";
-  const password = passwordEl ? passwordEl.value : "";
-
-  if (!email || !password) {
-    showAuthError(role, "Please enter your email and password.");
+  if (!email) {
+    if (errEl) { errEl.textContent = "Please enter your email address."; errEl.style.display = "block"; }
     return;
   }
 
-  // Basic email validation — must be a valid email (Gmail encouraged but any email works)
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    showAuthError(role, "Please enter a valid email address.");
-    return;
-  }
+  const btn = document.getElementById(`authForgotSendBtn-${role}`);
+  const origText = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.innerHTML = "⏳ Sending OTP..."; }
 
   try {
-    // Try backend auth if available; fall back to accepting any valid email+password
-    let userName = email.split("@")[0].replace(/[._]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-    try {
-      const res = await API.auth.login({ email, password, role });
-      if (res && res.user) {
-        userName = res.user.full_name || userName;
-      }
-    } catch (apiErr) {
-      // Backend auth not available — accept any email/password as valid for demo
-      if (password.length < 6) {
-        showAuthError(role, "Password must be at least 6 characters.");
-        return;
-      }
-    }
+    const res = await API.auth.forgotPasswordSendOtp(email);
+    showToast(res.message || "6-digit OTP sent to your email!", "info");
 
-    // Grant access
-    AuthState.sessions[role] = { email, name: userName, loginTime: new Date() };
-    closeAuthModal(role);
-    showToast(`✅ Signed in as ${userName} — Welcome to ${formatRole(role)} panel!`, "success");
-    switchToPanel(role);
-
+    const step1 = document.getElementById(`authForgotStep1-${role}`);
+    const step2 = document.getElementById(`authForgotStep2-${role}`);
+    if (step1) step1.style.display = "none";
+    if (step2) step2.style.display = "block";
   } catch (err) {
-    showAuthError(role, err.message || "Login failed. Please check your credentials.");
+    if (errEl) {
+      errEl.textContent = err.message || "Failed to send OTP. Please check your email.";
+      errEl.style.display = "block";
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = origText; }
   }
 }
 
-// ===================================================================
-// HANDLE LOGIN: Admin Panel (hardcoded credentials)
-// ===================================================================
-function handleAdminLogin(event) {
+async function handleResetPassword(event, role) {
   event.preventDefault();
 
-  const usernameEl = document.getElementById("adminUsername");
-  const passwordEl = document.getElementById("adminPassword");
+  const emailEl = document.getElementById(`authForgotEmail-${role}`);
+  const otpEl   = document.getElementById(`authForgotOtp-${role}`);
+  const passEl  = document.getElementById(`authForgotNewPassword-${role}`);
+  const confEl  = document.getElementById(`authForgotConfirm-${role}`);
+  const errEl   = document.getElementById(`authError-forgot2-${role}`);
 
-  const username = usernameEl ? usernameEl.value.trim() : "";
-  const password = passwordEl ? passwordEl.value : "";
+  const email        = emailEl ? emailEl.value.trim().toLowerCase() : "";
+  const otp          = otpEl ? otpEl.value.trim() : "";
+  const new_password = passEl ? passEl.value : "";
+  const confirm      = confEl ? confEl.value : "";
 
-  if (!username || !password) {
-    showAuthError("super_admin", "Please enter username and password.");
+  if (!otp || !new_password || !confirm) {
+    if (errEl) { errEl.textContent = "Please fill in all fields."; errEl.style.display = "block"; }
     return;
   }
 
-  // Strict hardcoded credential check (case-sensitive)
-  if (username === AuthState.ADMIN_USERNAME && password === AuthState.ADMIN_PASSWORD) {
-    AuthState.sessions["super_admin"] = { email: "admin@agrofuture.in", name: "Agrofuture Admin", loginTime: new Date() };
-    closeAuthModal("super_admin");
+  if (new_password.length < 8 || !/[A-Za-z]/.test(new_password) || !/[0-9]/.test(new_password)) {
+    if (errEl) { errEl.textContent = "Password must be at least 8 characters with letters & numbers."; errEl.style.display = "block"; }
+    return;
+  }
 
-    // Clear inputs for security
-    if (usernameEl) usernameEl.value = "";
-    if (passwordEl) passwordEl.value = "";
+  if (new_password !== confirm) {
+    if (errEl) { errEl.textContent = "Passwords do not match."; errEl.style.display = "block"; }
+    return;
+  }
 
-    showToast("✅ Admin access granted — Welcome, Agrofuture Admin!", "success");
-    switchToPanel("super_admin");
-  } else {
-    showAuthError("super_admin", "❌ Invalid credentials. Access denied.");
-    // Shake the form for visual feedback
-    const box = document.querySelector("#authModal-super_admin .auth-modal-box");
-    if (box) {
-      box.style.animation = "none";
-      box.offsetHeight; // reflow
-      box.style.animation = "authShake 0.4s ease";
+  const submitBtn = event.target.querySelector("button[type='submit']");
+  const origBtnText = submitBtn ? submitBtn.innerHTML : "";
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = "⏳ Updating password..."; }
+
+  try {
+    const res = await API.auth.forgotPasswordReset({ email, otp, new_password });
+    showToast(res.message || "Password updated successfully! Please sign in.", "success");
+
+    // Return to login view and prefill email
+    switchAuthView(role, "login");
+    const loginEmailEl = role === "super_admin"
+      ? document.getElementById("adminEmail")
+      : document.getElementById(`authEmail-${role}`);
+    if (loginEmailEl) loginEmailEl.value = email;
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = err.message || "Failed to reset password. Please verify the OTP.";
+      errEl.style.display = "block";
     }
+  } finally {
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = origBtnText; }
   }
 }
 
@@ -256,19 +880,94 @@ function handleGoogleSignIn(role) {
 
   const name = email.split("@")[0].replace(/[._]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
   AuthState.sessions[role] = { email, name, loginTime: new Date(), via: "google" };
-  closeAuthModal(role);
-  showToast(`✅ Signed in with Google as ${name}!`, "success");
-  switchToPanel(role);
+  showAuthSuccess(role, "Signed in with Google!", `Welcome, ${name}!`, () => {
+    closeAuthModal(role);
+    showToast(`✅ Signed in with Google as ${name}!`, "success");
+    switchToPanel(role);
+  });
 }
 
 // ===================================================================
-// AUTH ERROR DISPLAY
+// AUTH ERROR DISPLAY & FIELD SHAKE
 // ===================================================================
-function showAuthError(role, message) {
-  const errEl = document.getElementById(`authError-${role}`);
+function showAuthError(role, message, inputId) {
+  const errEl = document.getElementById(`authError-${role}`) ||
+                document.getElementById(`authError-signup-${role}`) ||
+                document.getElementById(`authError-otp-${role}`) ||
+                document.getElementById(`authError-forgot-${role}`) ||
+                document.getElementById(`authError-forgot2-${role}`);
   if (errEl) {
     errEl.textContent = message;
     errEl.style.display = "block";
+  }
+
+  // Find target input field to shake
+  let field = inputId ? document.getElementById(inputId) : null;
+  if (!field) {
+    const modal = document.getElementById(`authModal-${role}`);
+    if (modal) {
+      const activeView = modal.querySelector(".auth-view.active") || modal;
+      field = activeView.querySelector("input:focus") ||
+              activeView.querySelector("input[type='password']") ||
+              activeView.querySelector(".auth-code-input") ||
+              activeView.querySelector("input[type='email']") ||
+              activeView.querySelector("input");
+    }
+  }
+
+  if (field) {
+    field.classList.remove("field-error-shake");
+    void field.offsetWidth; // re-flow
+    field.classList.add("field-error-shake");
+    field.focus();
+    setTimeout(() => {
+      field.classList.remove("field-error-shake");
+    }, 450);
+  }
+}
+
+// ===================================================================
+// AUTH SUCCESS (Green SVG checkmark stroke draw animation)
+// ===================================================================
+function showAuthSuccess(role, title, message, callback) {
+  const modal = document.getElementById(`authModal-${role}`);
+  if (!modal) {
+    if (callback) callback();
+    return;
+  }
+
+  // Hide all auth views
+  modal.querySelectorAll(".auth-view").forEach(v => v.classList.remove("active"));
+
+  const successView = document.getElementById(`authSuccess-${role}`);
+  if (successView) {
+    const titleEl = document.getElementById(`authSuccessTitle-${role}`);
+    const msgEl = document.getElementById(`authSuccessMsg-${role}`);
+    if (titleEl && title) titleEl.textContent = title;
+    if (msgEl && message) msgEl.textContent = message;
+
+    successView.classList.add("active");
+
+    // Retrigger SVG stroke draw animations
+    const circle = successView.querySelector(".auth-success-circle");
+    const check = successView.querySelector(".auth-success-check");
+    if (circle) {
+      circle.style.animation = "none";
+      void circle.offsetWidth;
+      circle.style.animation = "strokeCircleDraw 0.55s cubic-bezier(0.65, 0, 0.45, 1) forwards";
+    }
+    if (check) {
+      check.style.animation = "none";
+      void check.offsetWidth;
+      check.style.animation = "strokeCheckDraw 0.38s cubic-bezier(0.65, 0, 0.45, 1) 0.36s forwards";
+    }
+
+    setTimeout(() => {
+      successView.classList.remove("active");
+      if (callback) callback();
+    }, 720);
+  } else {
+    if (callback) callback();
   }
 }
 
@@ -287,21 +986,9 @@ function toggleAuthPassword(inputId, btn) {
   }
 }
 
-// Add shake keyframe for admin wrong password
-(function() {
-  const style = document.createElement("style");
-  style.textContent = `@keyframes authShake {
-    0%,100%{transform:translateX(0)}
-    20%{transform:translateX(-8px)}
-    40%{transform:translateX(8px)}
-    60%{transform:translateX(-6px)}
-    80%{transform:translateX(6px)}
-  }`;
-  document.head.appendChild(style);
-})();
-
 // ================= INITIALIZATION =================
 document.addEventListener("DOMContentLoaded", async () => {
+  document.body.classList.add("on-landing");
   initCartFromStorage();
   // Start on landing page — do NOT auto-load user or panel
   AppState.currentRole = "landing";
@@ -311,6 +998,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     btn.classList.add("locked");
   });
   setupEventListeners();
+  initHeroParallax();
+  initNavbarScroll();
+  initScrollReveal();
+  initStatsObserver();
 });
 
 
@@ -452,7 +1143,7 @@ async function loadProduceCatalog() {
                   <span class="qty-val" id="qty-${p.id}">1</span>
                   <button type="button" class="qty-btn" onclick="stepProduceQty('${p.id}', 1)">+</button>
                 </div>
-                <button type="button" class="btn-add-cart" onclick="addToCart('${p.id}', '${escapeHtml(p.title)}', ${p.price_per_unit}, '${p.unit}', '${p.image_url}', '${p.farmer_id}')">
+                <button type="button" class="btn-add-cart" onclick="addToCart('${p.id}', '${escapeHtml(p.title)}', ${p.price_per_unit}, '${p.unit}', '${p.image_url}', '${p.farmer_id}', event)">
                   🛒 Add to Cart
                 </button>
               </div>
@@ -463,6 +1154,7 @@ async function loadProduceCatalog() {
         </div>
       `;
     }).join("");
+    setTimeout(() => { if (typeof initScrollReveal === "function") initScrollReveal(); }, 50);
   } catch (err) {
     container.innerHTML = `<div style="grid-column: 1/-1; color: #dc2626; padding: 20px;">Failed to load produce: ${err.message}</div>`;
   }
@@ -536,6 +1228,7 @@ async function loadMachineryCatalog() {
         </div>
       `;
     }).join("");
+    setTimeout(() => { if (typeof initScrollReveal === "function") initScrollReveal(); }, 50);
   } catch (err) {
     container.innerHTML = `<div style="grid-column: 1/-1; color: #dc2626; padding: 20px;">Failed to load machinery: ${err.message}</div>`;
   }
@@ -761,7 +1454,63 @@ function updateCartBadge() {
   });
 }
 
-function addToCart(productId, title, price, unit, image, farmerId) {
+function triggerCartBadgeBounce() {
+  const badges = document.querySelectorAll(".cart-badge");
+  badges.forEach(b => {
+    b.classList.remove("cart-badge-bounce");
+    void b.offsetWidth;
+    b.classList.add("cart-badge-bounce");
+  });
+}
+
+function animateFlyToCart(e, imageUrl) {
+  try {
+    const btn = (e && e.target) ? (e.target.closest("button") || e.target) : null;
+    const card = btn ? (btn.closest(".product-card") || btn.closest(".machinery-card")) : null;
+    const imgEl = card ? card.querySelector(".card-img") : btn;
+    if (!imgEl) return;
+
+    const startRect = imgEl.getBoundingClientRect();
+    const cartBtn = document.querySelector(".cart-trigger-btn") || document.querySelector(".cart-badge");
+    if (!cartBtn) return;
+    const destRect = cartBtn.getBoundingClientRect();
+
+    const flyer = document.createElement("div");
+    flyer.className = "fly-to-cart-ghost";
+    if (imageUrl) {
+      flyer.style.backgroundImage = `url('${imageUrl}')`;
+    } else {
+      flyer.textContent = "🛒";
+    }
+
+    flyer.style.top = `${startRect.top + startRect.height / 2 - 26}px`;
+    flyer.style.left = `${startRect.left + startRect.width / 2 - 26}px`;
+    document.body.appendChild(flyer);
+
+    requestAnimationFrame(() => {
+      const deltaX = (destRect.left + destRect.width / 2) - (startRect.left + startRect.width / 2);
+      const deltaY = (destRect.top + destRect.height / 2) - (startRect.top + startRect.height / 2);
+      flyer.style.transform = `translate(${deltaX}px, ${deltaY}px) scale(0.2)`;
+      flyer.style.opacity = "0.2";
+    });
+
+    setTimeout(() => {
+      if (flyer.parentNode) {
+        flyer.parentNode.removeChild(flyer);
+      }
+      triggerCartBadgeBounce();
+    }, 650);
+  } catch (err) {
+    console.warn("Fly to cart error:", err);
+  }
+}
+
+function addToCart(productId, title, price, unit, image, farmerId, evt) {
+  const e = evt || window.event;
+  if (e) {
+    animateFlyToCart(e, image);
+  }
+
   const qtyEl = document.getElementById(`qty-${productId}`);
   const qty = qtyEl ? parseInt(qtyEl.textContent) || 1 : 1;
 
@@ -943,11 +1692,11 @@ async function loadFarmerMetrics() {
 
     const commPaid = grossSales - netEarnings;
 
-    document.getElementById("farmerStatListings").textContent = totalListings;
-    document.getElementById("farmerStatOrders").textContent = totalOrders;
-    document.getElementById("farmerStatGrossSales").textContent = `₹${grossSales.toFixed(2)}`;
-    document.getElementById("farmerStatNetEarnings").textContent = `₹${netEarnings.toFixed(2)}`;
-    document.getElementById("farmerStatCommission").textContent = `₹${commPaid.toFixed(2)} (Platform 5%)`;
+    animateCountUp(document.getElementById("farmerStatListings"), totalListings);
+    animateCountUp(document.getElementById("farmerStatOrders"), totalOrders);
+    animateCountUp(document.getElementById("farmerStatGrossSales"), grossSales, "₹", "", 2);
+    animateCountUp(document.getElementById("farmerStatNetEarnings"), netEarnings, "₹", "", 2);
+    animateCountUp(document.getElementById("farmerStatCommission"), commPaid, "₹", " (Platform 5%)", 2);
   } catch (err) {
     console.error("Failed to load farmer metrics:", err);
   }
@@ -1187,12 +1936,12 @@ async function loadSellerMetrics() {
 
     const commDeducted = grossTurnover - netEarnings;
 
-    document.getElementById("sellerStatFleet").textContent = totalFleet;
-    document.getElementById("sellerStatActive").textContent = activeRentals;
-    document.getElementById("sellerStatPending").textContent = pendingRequests;
-    document.getElementById("sellerStatGross").textContent = `₹${grossTurnover.toFixed(2)}`;
-    document.getElementById("sellerStatNet").textContent = `₹${netEarnings.toFixed(2)}`;
-    document.getElementById("sellerStatCommission").textContent = `₹${commDeducted.toFixed(2)} (Platform 10%)`;
+    animateCountUp(document.getElementById("sellerStatFleet"), totalFleet);
+    animateCountUp(document.getElementById("sellerStatActive"), activeRentals);
+    animateCountUp(document.getElementById("sellerStatPending"), pendingRequests);
+    animateCountUp(document.getElementById("sellerStatGross"), grossTurnover, "₹", "", 2);
+    animateCountUp(document.getElementById("sellerStatNet"), netEarnings, "₹", "", 2);
+    animateCountUp(document.getElementById("sellerStatCommission"), commDeducted, "₹", " (Platform 10%)", 2);
   } catch (err) {
     console.error("Failed to load seller metrics:", err);
   }
@@ -1426,13 +2175,13 @@ async function loadAdminMetrics() {
     const res = await API.admin.getMetrics();
     const m = res.metrics;
 
-    document.getElementById("adminStatTurnover").textContent = `₹${m.total_platform_turnover.toLocaleString('en-IN')}`;
-    document.getElementById("adminStatCommission").textContent = `₹${m.total_admin_commission.toLocaleString('en-IN')}`;
-    document.getElementById("adminStatProduceComm").textContent = `₹${m.produce_commission_earned.toLocaleString('en-IN')}`;
-    document.getElementById("adminStatMachineryComm").textContent = `₹${m.machinery_commission_earned.toLocaleString('en-IN')}`;
-    document.getElementById("adminStatFarmers").textContent = m.total_farmers;
-    document.getElementById("adminStatSellers").textContent = m.total_sellers;
-    document.getElementById("adminStatCustomers").textContent = m.total_customers;
+    animateCountUp(document.getElementById("adminStatTurnover"), m.total_platform_turnover, "₹", "", 2);
+    animateCountUp(document.getElementById("adminStatCommission"), m.total_admin_commission, "₹", "", 2);
+    animateCountUp(document.getElementById("adminStatProduceComm"), m.produce_commission_earned, "₹", "", 2);
+    animateCountUp(document.getElementById("adminStatMachineryComm"), m.machinery_commission_earned, "₹", "", 2);
+    animateCountUp(document.getElementById("adminStatFarmers"), m.total_farmers);
+    animateCountUp(document.getElementById("adminStatSellers"), m.total_sellers);
+    animateCountUp(document.getElementById("adminStatCustomers"), m.total_customers);
     document.getElementById("adminStatOrders").textContent = `${m.total_orders} Orders / ${m.total_bookings} Rentals`;
   } catch (err) {
     console.error("Failed to load admin metrics:", err);
@@ -1695,4 +2444,173 @@ function debounce(func, wait) {
     clearTimeout(timeout);
     timeout = setTimeout(() => func.apply(this, args), wait);
   };
+}
+
+// ===================================================================
+// ANIMATION ENHANCEMENTS: Scroll Reveal, Parallax, Count-up, Navbar
+// ===================================================================
+
+/**
+ * Animate numbers counting up from 0 to target value with cubic ease-out
+ */
+function animateCountUp(element, targetVal, prefix = "", suffix = "", decimals = 0, duration = 1200) {
+  if (!element) return;
+  const target = parseFloat(targetVal);
+  if (isNaN(target)) {
+    element.textContent = `${prefix}${targetVal}${suffix}`;
+    return;
+  }
+
+  const startTime = performance.now();
+  const startVal = 0;
+
+  function step(currentTime) {
+    const elapsed = currentTime - startTime;
+    const progress = Math.min(elapsed / duration, 1);
+    // Cubic ease-out
+    const easeProgress = 1 - Math.pow(1 - progress, 3);
+    const current = startVal + (target - startVal) * easeProgress;
+
+    let formatted;
+    if (decimals > 0) {
+      formatted = current.toFixed(decimals);
+    } else {
+      formatted = Math.round(current).toLocaleString("en-IN");
+    }
+
+    element.textContent = `${prefix}${formatted}${suffix}`;
+
+    if (progress < 1) {
+      requestAnimationFrame(step);
+    } else {
+      const finalFormatted = decimals > 0 ? target.toFixed(decimals) : target.toLocaleString("en-IN");
+      element.textContent = `${prefix}${finalFormatted}${suffix}`;
+    }
+  }
+
+  requestAnimationFrame(step);
+}
+
+/**
+ * Observe stats in viewport and trigger count-up once
+ */
+let statsObserver = null;
+function initStatsObserver() {
+  if (statsObserver) statsObserver.disconnect();
+
+  statsObserver = new IntersectionObserver((entries, observer) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const el = entry.target;
+        const target = el.dataset.count;
+        if (target !== undefined) {
+          const prefix = el.dataset.prefix || "";
+          const suffix = el.dataset.suffix || "";
+          const decimals = parseInt(el.dataset.decimals || "0", 10);
+          animateCountUp(el, target, prefix, suffix, decimals, 1400);
+        }
+        observer.unobserve(el);
+      }
+    });
+  }, {
+    threshold: 0.15
+  });
+
+  document.querySelectorAll(".stat-counter").forEach(el => statsObserver.observe(el));
+}
+
+/**
+ * Scroll Reveal: Fade in + slide up 20px with staggered 80ms delay between grid cards
+ */
+let scrollRevealObserver = null;
+function initScrollReveal() {
+  if (scrollRevealObserver) scrollRevealObserver.disconnect();
+
+  scrollRevealObserver = new IntersectionObserver((entries, observer) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add("revealed");
+        observer.unobserve(entry.target);
+      }
+    });
+  }, {
+    threshold: 0.08,
+    rootMargin: "0px 0px -30px 0px"
+  });
+
+  const targets = document.querySelectorAll(
+    ".landing-workspace-section, .landing-ws-card, .landing-impact-stats-wrap, " +
+    ".landing-trust-strip-wrapper, .landing-dark-footer, .hero-banner, .stat-card, " +
+    ".table-container, .product-card, .machinery-card, .reveal-on-scroll"
+  );
+
+  targets.forEach(el => {
+    if (!el.classList.contains("revealed")) {
+      el.classList.add("reveal-on-scroll");
+
+      // Calculate 80ms stagger for cards sharing a parent grid
+      const parentGrid = el.closest(".landing-cards-grid, .stats-grid, .catalog-grid");
+      if (parentGrid) {
+        const siblings = Array.from(parentGrid.children).filter(c => c.nodeType === 1);
+        const index = siblings.indexOf(el);
+        if (index >= 0) {
+          el.style.transitionDelay = `${index * 80}ms`;
+        }
+      }
+      scrollRevealObserver.observe(el);
+    }
+  });
+}
+
+/**
+ * Subtle parallax on the hero image (moves slower than scroll)
+ */
+function initHeroParallax() {
+  const tractorImg = document.querySelector(".landing-hero-tractor-img");
+  if (!tractorImg) return;
+
+  let ticking = false;
+  window.addEventListener("scroll", () => {
+    if (!ticking) {
+      window.requestAnimationFrame(() => {
+        const landing = document.getElementById("panel-landing");
+        if (landing && landing.classList.contains("active")) {
+          const scrollY = window.scrollY;
+          if (scrollY < 900) {
+            tractorImg.style.transform = `translateY(${scrollY * 0.12}px)`;
+          }
+        }
+        ticking = false;
+      });
+      ticking = true;
+    }
+  }, { passive: true });
+}
+
+/**
+ * Navbar: Becomes slightly smaller with shadow after scrolling 50px
+ * Underline slides in under active/hovered link
+ */
+function initNavbarScroll() {
+  const navWrapper = document.querySelector(".landing-floating-nav-wrapper");
+  if (!navWrapper) return;
+
+  const onScroll = () => {
+    if (window.scrollY > 50) {
+      navWrapper.classList.add("scrolled");
+    } else {
+      navWrapper.classList.remove("scrolled");
+    }
+  };
+
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  // Sliding underline updates on click
+  document.querySelectorAll(".landing-nav-link").forEach(link => {
+    link.addEventListener("click", () => {
+      document.querySelectorAll(".landing-nav-link").forEach(l => l.classList.remove("active"));
+      link.classList.add("active");
+    });
+  });
 }

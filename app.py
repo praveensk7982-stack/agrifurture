@@ -1,10 +1,10 @@
 import os
-from flask import Flask, render_template, jsonify, send_from_directory
-from flask_cors import CORS
+from flask import Flask, render_template, jsonify
 from config import Config
 
 # Import Blueprints
 from routes.auth_routes import auth_bp
+from routes.otp_routes import otp_bp
 from routes.product_routes import product_bp
 from routes.machinery_routes import machinery_bp
 from routes.order_routes import order_bp
@@ -15,10 +15,12 @@ def create_app():
     app = Flask(__name__, static_folder="static", template_folder="templates")
     app.config.from_object(Config)
 
-    CORS(app, supports_credentials=True)
+    # NOTE: CORS removed on purpose. The frontend is served by this same Flask app (same origin),
+    # so it is not needed, and open CORS + cookies is a security risk.
 
     # Register API Blueprints
     app.register_blueprint(auth_bp)
+    app.register_blueprint(otp_bp)
     app.register_blueprint(product_bp)
     app.register_blueprint(machinery_bp)
     app.register_blueprint(order_bp)
@@ -48,4 +50,4 @@ if __name__ == "__main__":
     print(f"======================================================")
     print(f"  AGRO FUTURE Platform running on http://127.0.0.1:{port}")
     print(f"======================================================")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="127.0.0.1", port=port, debug=os.getenv("FLASK_DEBUG") == "1")

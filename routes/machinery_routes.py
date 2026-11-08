@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify, session
 import uuid
 import datetime
 from database import db
+from routes.auth_routes import role_required
 
 machinery_bp = Blueprint("machinery_bp", __name__)
 
@@ -32,18 +33,16 @@ def get_machinery_item(machinery_id):
     return jsonify({"machinery": item})
 
 @machinery_bp.route("/api/machinery", methods=["POST"])
+@role_required("machinery_seller", "super_admin")
 def create_machinery_item():
     user_id = session.get("user_id")
     user_role = session.get("role")
 
     data = request.get_json() or {}
-    seller_id = data.get("seller_id") or user_id
-
-    # Fallback to demo seller if not authenticated as machinery seller
-    if not seller_id or user_role not in ["machinery_seller", "super_admin"]:
-        demo_seller = db.get_user_by_email("seller.kumar@agrofuture.com")
-        if demo_seller:
-            seller_id = demo_seller["id"]
+    if user_role == "super_admin" and data.get("seller_id"):
+        seller_id = data.get("seller_id")
+    else:
+        seller_id = user_id
 
     title = data.get("title", "").strip()
     category = data.get("category", "").strip().lower()
@@ -86,10 +85,16 @@ def create_machinery_item():
     return jsonify({"message": "Machinery listed successfully for rental!", "machinery": machinery_dict}), 201
 
 @machinery_bp.route("/api/machinery/<machinery_id>", methods=["PUT"])
+@role_required("machinery_seller", "super_admin")
 def update_machinery_item(machinery_id):
     existing = db.get_machinery_by_id(machinery_id)
     if not existing:
         return jsonify({"error": "Machinery not found."}), 404
+
+    user_id = session.get("user_id")
+    user_role = session.get("role")
+    if user_role == "machinery_seller" and existing.get("seller_id") != user_id:
+        return jsonify({"error": "You do not have permission to update this machinery."}), 403
 
     data = request.get_json() or {}
     allowed_fields = ["title", "category", "model_info", "specifications", "hourly_rate", "daily_rate", "location", "includes_operator", "operator_charge_per_hour", "image_url", "is_available", "status"]
@@ -114,10 +119,16 @@ def update_machinery_item(machinery_id):
     return jsonify({"message": "Machinery updated successfully!", "machinery": updated_item})
 
 @machinery_bp.route("/api/machinery/<machinery_id>", methods=["DELETE"])
+@role_required("machinery_seller", "super_admin")
 def delete_machinery_item(machinery_id):
     existing = db.get_machinery_by_id(machinery_id)
     if not existing:
         return jsonify({"error": "Machinery not found."}), 404
+
+    user_id = session.get("user_id")
+    user_role = session.get("role")
+    if user_role == "machinery_seller" and existing.get("seller_id") != user_id:
+        return jsonify({"error": "You do not have permission to delete this machinery."}), 403
 
     db.delete_machinery(machinery_id)
     return jsonify({"message": "Machinery removed from catalog!"})

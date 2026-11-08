@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 90" width="100%" height="100%">
+  <!-- Brown Soil Mound -->
+  <path d="M 12 76 C 16 52, 84 52, 88 76 C 88 80, 12 80, 12 76 Z" fill="#8d5b4c"/>
+  <ellipse cx="50" cy="74" rx="38" ry="6" fill="#754738" opacity="0.3"/>
+  <!-- Central Green Stem -->
+  <path d="M 47 62 C 47 42, 48 30, 48 20 L 52 20 C 52 30, 53 42, 53 62 Z" fill="#4ade80"/>
+  <!-- Left Leaf -->
+  <path d="M 48 36 C 32 36, 12 28, 10 12 C 26 10, 46 22, 48 36 Z" fill="#74c738"/>
+  <path d="M 48 36 C 34 32, 22 24, 16 16 C 28 14, 44 24, 48 36 Z" fill="#8ce042" opacity="0.5"/>
+  <!-- Right Leaf -->
+  <path d="M 52 36 C 68 36, 88 28, 90 12 C 74 10, 54 22, 52 36 Z" fill="#5cb62b"/>
+  <path d="M 52 36 C 66 32, 78 24, 84 16 C 72 14, 56 24, 52 36 Z" fill="#76ce35" opacity="0.4"/>
+</svg>

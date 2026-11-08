@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify, session
 import uuid
 import datetime
 from database import db
+from routes.auth_routes import role_required
 
 product_bp = Blueprint("product_bp", __name__)
 
@@ -29,18 +30,17 @@ def get_product(product_id):
     return jsonify({"product": product})
 
 @product_bp.route("/api/products", methods=["POST"])
+@role_required("farmer", "super_admin")
 def create_product():
     user_id = session.get("user_id")
     user_role = session.get("role")
 
     data = request.get_json() or {}
-    farmer_id = data.get("farmer_id") or user_id
-
-    # Fallback to demo farmer if not authenticated as farmer
-    if not farmer_id or user_role not in ["farmer", "super_admin"]:
-        demo_farmer = db.get_user_by_email("farmer.rajesh@agrofuture.com")
-        if demo_farmer:
-            farmer_id = demo_farmer["id"]
+    # Allow super_admin to specify farmer_id; otherwise use authenticated user_id
+    if user_role == "super_admin" and data.get("farmer_id"):
+        farmer_id = data.get("farmer_id")
+    else:
+        farmer_id = user_id
 
     title = data.get("title", "").strip()
     category = data.get("category", "").strip().lower()
@@ -83,10 +83,17 @@ def create_product():
     return jsonify({"message": "Produce listing created successfully!", "product": product_dict}), 201
 
 @product_bp.route("/api/products/<product_id>", methods=["PUT"])
+@role_required("farmer", "super_admin")
 def update_product(product_id):
     existing = db.get_product_by_id(product_id)
     if not existing:
         return jsonify({"error": "Product not found."}), 404
+
+    # Enforce ownership for farmers
+    user_id = session.get("user_id")
+    user_role = session.get("role")
+    if user_role == "farmer" and existing.get("farmer_id") != user_id:
+        return jsonify({"error": "You do not have permission to update this product."}), 403
 
     data = request.get_json() or {}
     allowed_fields = ["title", "category", "variety", "description", "price_per_unit", "unit", "stock_quantity", "is_organic", "image_url", "status"]
@@ -111,10 +118,16 @@ def update_product(product_id):
     return jsonify({"message": "Product updated successfully!", "product": updated_product})
 
 @product_bp.route("/api/products/<product_id>", methods=["DELETE"])
+@role_required("farmer", "super_admin")
 def delete_product(product_id):
     existing = db.get_product_by_id(product_id)
     if not existing:
         return jsonify({"error": "Product not found."}), 404
+
+    user_id = session.get("user_id")
+    user_role = session.get("role")
+    if user_role == "farmer" and existing.get("farmer_id") != user_id:
+        return jsonify({"error": "You do not have permission to delete this product."}), 403
 
     db.delete_product(product_id)
     return jsonify({"message": "Product removed successfully!"})

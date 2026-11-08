@@ -3,10 +3,12 @@ import uuid
 import datetime
 import random
 from database import db
+from routes.auth_routes import login_required, role_required
 
 booking_bp = Blueprint("booking_bp", __name__)
 
 @booking_bp.route("/api/bookings", methods=["POST"])
+@login_required
 def book_machinery():
     data = request.get_json() or {}
     machinery_id = data.get("machinery_id")
@@ -32,9 +34,6 @@ def book_machinery():
         return jsonify({"error": "Machinery not found."}), 404
 
     user_id = session.get("user_id")
-    if not user_id:
-        demo_customer = db.get_user_by_email("customer.anita@agrofuture.com")
-        user_id = demo_customer["id"] if demo_customer else None
 
     # Calculate rates
     if rental_type == "hourly":
@@ -101,27 +100,33 @@ def book_machinery():
     }), 201
 
 @booking_bp.route("/api/bookings", methods=["GET"])
+@login_required
 def list_bookings():
     user_id = session.get("user_id")
     user_role = session.get("role")
-    role_param = request.args.get("role", user_role)
+    role_param = request.args.get("role")
 
-    if role_param == "machinery_seller":
-        seller_id = request.args.get("seller_id") or user_id
-        if not seller_id:
-            demo_seller = db.get_user_by_email("seller.kumar@agrofuture.com")
-            seller_id = demo_seller["id"] if demo_seller else None
-        bookings = db.get_bookings(seller_id=seller_id)
-    elif role_param == "customer":
-        customer_id = request.args.get("customer_id") or user_id
-        bookings = db.get_bookings(customer_id=customer_id)
+    # Enforce RBAC
+    if role_param and role_param != user_role and user_role != "super_admin":
+        return jsonify({"error": "Forbidden: You cannot view bookings for other roles."}), 403
+
+    effective_role = role_param or user_role
+
+    if effective_role == "machinery_seller":
+        bookings = db.get_bookings(seller_id=user_id)
+    elif effective_role == "customer":
+        bookings = db.get_bookings(customer_id=user_id)
+    elif effective_role == "super_admin":
+        s_id = request.args.get("seller_id")
+        c_id = request.args.get("customer_id")
+        bookings = db.get_bookings(seller_id=s_id, customer_id=c_id)
     else:
-        # Admin or global
-        bookings = db.get_bookings()
+        bookings = db.get_bookings(customer_id=user_id)
 
     return jsonify({"bookings": bookings, "count": len(bookings)})
 
 @booking_bp.route("/api/bookings/<booking_id>/status", methods=["PATCH"])
+@role_required("machinery_seller", "super_admin")
 def update_status(booking_id):
     data = request.get_json() or {}
     new_status = data.get("status", "").strip().lower()

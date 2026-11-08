@@ -2,6 +2,7 @@ import os
 import uuid
 import sqlite3
 import datetime
+from werkzeug.security import generate_password_hash
 from config import Config
 
 # Supabase imports
@@ -55,6 +56,16 @@ class Database:
             avatar_url TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS email_otps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL,
+    otp_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
 
         CREATE TABLE IF NOT EXISTS platform_settings (
             id INTEGER PRIMARY KEY DEFAULT 1,
@@ -152,21 +163,22 @@ class Database:
         );
         """)
         
-        # Check if profiles table is empty in SQLite; seed if so
+        # Check if profiles table is empty in SQLite; seed only in debug mode
         cur.execute("SELECT COUNT(*) FROM profiles")
         if cur.fetchone()[0] == 0:
-            self._seed_sqlite(cur)
+            if os.getenv("FLASK_DEBUG") == "1":
+                self._seed_sqlite(cur)
 
         conn.commit()
         conn.close()
 
     def _seed_sqlite(self, cur):
-        # Demo Users
+        # Demo Users with real secure hashes (never $demo)
+        default_hash = generate_password_hash("AgroPass123!")
         users = [
-            ('11111111-1111-1111-1111-111111111111', 'admin@agrofuture.com', 'pbkdf2:sha256:260000$adminhash$demo', 'Vikramaditya Rao (Super Admin)', '+91 98765 00001', 'super_admin', 'active', 'Bangalore, Karnataka', 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150'),
-            ('22222222-2222-2222-2222-222222222222', 'farmer.rajesh@agrofuture.com', 'pbkdf2:sha256:260000$farmerhash$demo', 'Rajesh Patel (Greenfields Organics)', '+91 98765 00002', 'farmer', 'active', 'Nashik, Maharashtra', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150'),
-            ('33333333-3333-3333-3333-333333333333', 'seller.kumar@agrofuture.com', 'pbkdf2:sha256:260000$sellerhash$demo', 'Suresh Kumar (AgroTech Equipment)', '+91 98765 00003', 'machinery_seller', 'active', 'Coimbatore, Tamil Nadu', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150'),
-            ('44444444-4444-4444-4444-444444444444', 'customer.anita@agrofuture.com', 'pbkdf2:sha256:260000$customerhash$demo', 'Anita Sharma (Agri Buyer & Farm Owner)', '+91 98765 00004', 'customer', 'active', 'Pune, Maharashtra', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150')
+            ('22222222-2222-2222-2222-222222222222', 'farmer.rajesh@agrofuture.com', default_hash, 'Rajesh Patel (Greenfields Organics)', '+91 98765 00002', 'farmer', 'active', 'Nashik, Maharashtra', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150'),
+            ('33333333-3333-3333-3333-333333333333', 'seller.kumar@agrofuture.com', default_hash, 'Suresh Kumar (AgroTech Equipment)', '+91 98765 00003', 'machinery_seller', 'active', 'Coimbatore, Tamil Nadu', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150'),
+            ('44444444-4444-4444-4444-444444444444', 'customer.anita@agrofuture.com', default_hash, 'Anita Sharma (Agri Buyer & Farm Owner)', '+91 98765 00004', 'customer', 'active', 'Pune, Maharashtra', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150')
         ]
         cur.executemany("INSERT INTO profiles (id, email, password_hash, full_name, phone, role, status, location, avatar_url) VALUES (?,?,?,?,?,?,?,?,?)", users)
 
@@ -289,6 +301,19 @@ class Database:
 
         conn = self._get_sqlite_conn()
         conn.execute("UPDATE profiles SET status = ? WHERE id = ?", (status, user_id))
+        conn.commit()
+        conn.close()
+        return True
+
+    def update_user_password(self, user_id, password_hash):
+        if self.use_supabase:
+            try:
+                self.client.table("profiles").update({"password_hash": password_hash}).eq("id", user_id).execute()
+            except Exception as e:
+                print(f"[DB] Supabase update user password: {e}")
+
+        conn = self._get_sqlite_conn()
+        conn.execute("UPDATE profiles SET password_hash = ? WHERE id = ?", (password_hash, user_id))
         conn.commit()
         conn.close()
         return True

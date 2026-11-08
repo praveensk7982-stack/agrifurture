@@ -3,10 +3,12 @@ import uuid
 import datetime
 import random
 from database import db
+from routes.auth_routes import login_required, role_required
 
 order_bp = Blueprint("order_bp", __name__)
 
 @order_bp.route("/api/orders", methods=["POST"])
+@login_required
 def place_order():
     data = request.get_json() or {}
     items_data = data.get("items", [])
@@ -21,10 +23,6 @@ def place_order():
         return jsonify({"error": "Shipping address and contact phone number are required."}), 400
 
     user_id = session.get("user_id")
-    if not user_id:
-        # Fallback to demo customer
-        demo_customer = db.get_user_by_email("customer.anita@agrofuture.com")
-        user_id = demo_customer["id"] if demo_customer else None
 
     # Fetch platform commission settings
     settings = db.get_platform_settings()
@@ -90,29 +88,33 @@ def place_order():
     }), 201
 
 @order_bp.route("/api/orders", methods=["GET"])
+@login_required
 def list_orders():
     user_id = session.get("user_id")
     user_role = session.get("role")
-    
-    # Query parameters can override for specific panel views
-    role_param = request.args.get("role", user_role)
-    
-    if role_param == "farmer":
-        farmer_id = request.args.get("farmer_id") or user_id
-        if not farmer_id:
-            demo_farmer = db.get_user_by_email("farmer.rajesh@agrofuture.com")
-            farmer_id = demo_farmer["id"] if demo_farmer else None
-        orders = db.get_orders(farmer_id=farmer_id)
-    elif role_param == "customer":
-        customer_id = request.args.get("customer_id") or user_id
-        orders = db.get_orders(customer_id=customer_id)
+    role_param = request.args.get("role")
+
+    # Enforce RBAC: users cannot access panels for other roles
+    if role_param and role_param != user_role and user_role != "super_admin":
+        return jsonify({"error": "Forbidden: You cannot view orders for other roles."}), 403
+
+    effective_role = role_param or user_role
+
+    if effective_role == "farmer":
+        orders = db.get_orders(farmer_id=user_id)
+    elif effective_role == "customer":
+        orders = db.get_orders(customer_id=user_id)
+    elif effective_role == "super_admin":
+        f_id = request.args.get("farmer_id")
+        c_id = request.args.get("customer_id")
+        orders = db.get_orders(farmer_id=f_id, customer_id=c_id)
     else:
-        # Admin or global
-        orders = db.get_orders()
+        orders = db.get_orders(customer_id=user_id)
 
     return jsonify({"orders": orders, "count": len(orders)})
 
 @order_bp.route("/api/orders/<order_id>/status", methods=["PATCH"])
+@role_required("farmer", "super_admin")
 def update_status(order_id):
     data = request.get_json() or {}
     new_status = data.get("status", "").strip().lower()
