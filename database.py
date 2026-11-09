@@ -46,11 +46,15 @@ class Database:
             self._init_sqlite()
 
     def _get_sqlite_conn(self):
+        if Config.IS_VERCEL or self.is_vercel or self.use_supabase:
+            raise RuntimeError("SQLite is disabled on Vercel: missing Supabase branch")
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _init_sqlite(self):
+        if Config.IS_VERCEL or self.is_vercel:
+            return
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -274,7 +278,7 @@ class Database:
         ordered newest first.
         """
         email_clean = (email or "").strip().lower()
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
                 query = self.client.table("email_otps").select("id, created_at").eq("email", email_clean)
                 if role:
@@ -285,29 +289,28 @@ class Database:
                 return res.data or []
             except Exception as e:
                 print(f"[DB] Supabase otp_recent_requests error: {e}")
-                if self.is_vercel:
-                    return []
-
-        conn = self._get_sqlite_conn()
-        sql = "SELECT id, created_at FROM email_otps WHERE email = ?"
-        params = [email_clean]
-        if role:
-            sql += " AND role = ?"
-            params.append(role)
-        if since_iso:
-            sql += " AND created_at > ?"
-            params.append(since_iso)
-        sql += " ORDER BY id DESC"
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+                return []
+        else:
+            conn = self._get_sqlite_conn()
+            sql = "SELECT id, created_at FROM email_otps WHERE email = ?"
+            params = [email_clean]
+            if role:
+                sql += " AND role = ?"
+                params.append(role)
+            if since_iso:
+                sql += " AND created_at > ?"
+                params.append(since_iso)
+            sql += " ORDER BY id DESC"
+            rows = conn.execute(sql, params).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
 
     def otp_invalidate_unused(self, email, role=None):
         """
         Marks unused OTPs for this email (and optional role) as used.
         """
         email_clean = (email or "").strip().lower()
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
                 query = self.client.table("email_otps").update({"used": True}).eq("email", email_clean).eq("used", False)
                 if role:
@@ -316,17 +319,16 @@ class Database:
                 return True
             except Exception as e:
                 print(f"[DB] Supabase otp_invalidate_unused error: {e}")
-                if self.is_vercel:
-                    return False
-
-        conn = self._get_sqlite_conn()
-        if role:
-            conn.execute("UPDATE email_otps SET used = 1 WHERE email = ? AND role = ? AND used = 0", (email_clean, role))
+                return False
         else:
-            conn.execute("UPDATE email_otps SET used = 1 WHERE email = ? AND used = 0", (email_clean,))
-        conn.commit()
-        conn.close()
-        return True
+            conn = self._get_sqlite_conn()
+            if role:
+                conn.execute("UPDATE email_otps SET used = 1 WHERE email = ? AND role = ? AND used = 0", (email_clean, role))
+            else:
+                conn.execute("UPDATE email_otps SET used = 1 WHERE email = ? AND used = 0", (email_clean,))
+            conn.commit()
+            conn.close()
+            return True
 
     def otp_insert(self, email, role, otp_hash, expires_at, created_at):
         """
@@ -343,30 +345,32 @@ class Database:
             "used": False,
             "verified": False
         }
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
                 res = self.client.table("email_otps").insert(payload).execute()
                 if res.data:
                     return res.data[0]
+                return payload
             except Exception as e:
                 print(f"[DB] Supabase otp_insert error: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """INSERT INTO email_otps (email, role, otp_hash, expires_at, created_at, attempts, used, verified)
-               VALUES (?, ?, ?, ?, ?, 0, 0, 0)""",
-            (email_clean, role, otp_hash, expires_at, created_at)
-        )
-        row_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-        payload["id"] = row_id
-        payload["used"] = 0
-        payload["verified"] = 0
-        return payload
+                return payload
+        else:
+            conn = self._get_sqlite_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO email_otps (email, role, otp_hash, expires_at, created_at, attempts, used, verified)
+                   VALUES (?, ?, ?, ?, ?, 0, 0, 0)""",
+                (email_clean, role, otp_hash, expires_at, created_at)
+            )
+            row_id = cur.lastrowid
+            conn.commit()
+            conn.close()
+            payload["id"] = row_id
+            payload["used"] = 0
+            payload["verified"] = 0
+            return payload
 
     def otp_get_latest_valid(self, email, role):
         """
@@ -376,7 +380,7 @@ class Database:
         email_clean = (email or "").strip().lower()
         now_dt = datetime.datetime.now(datetime.timezone.utc)
 
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
                 res = self.client.table("email_otps").select("*").eq("email", email_clean).eq("role", role).eq("used", False).order("id", desc=True).limit(1).execute()
                 if res.data:
@@ -394,34 +398,33 @@ class Database:
                 return None
             except Exception as e:
                 print(f"[DB] Supabase otp_get_latest_valid error: {e}")
-                if self.is_vercel:
-                    return None
-
-        conn = self._get_sqlite_conn()
-        row = conn.execute(
-            "SELECT * FROM email_otps WHERE email = ? AND role = ? AND used = 0 ORDER BY id DESC LIMIT 1",
-            (email_clean, role)
-        ).fetchone()
-        conn.close()
-        if row:
-            r = dict(row)
-            exp = str(r.get("expires_at", "")).replace("Z", "+00:00")
-            try:
-                exp_dt = datetime.datetime.fromisoformat(exp)
-                if exp_dt.tzinfo is None:
-                    exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
-                if exp_dt > now_dt:
-                    return r
-            except Exception:
-                if exp > now_dt.isoformat():
-                    return r
-        return None
+                return None
+        else:
+            conn = self._get_sqlite_conn()
+            row = conn.execute(
+                "SELECT * FROM email_otps WHERE email = ? AND role = ? AND used = 0 ORDER BY id DESC LIMIT 1",
+                (email_clean, role)
+            ).fetchone()
+            conn.close()
+            if row:
+                r = dict(row)
+                exp = str(r.get("expires_at", "")).replace("Z", "+00:00")
+                try:
+                    exp_dt = datetime.datetime.fromisoformat(exp)
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+                    if exp_dt > now_dt:
+                        return r
+                except Exception:
+                    if exp > now_dt.isoformat():
+                        return r
+            return None
 
     def otp_increment_attempts(self, otp_id):
         """
         Increments attempts count for the OTP with otp_id and returns the new attempts integer.
         """
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
                 res = self.client.table("email_otps").select("attempts").eq("id", otp_id).execute()
                 current = (res.data[0].get("attempts") or 0) if res.data else 0
@@ -430,53 +433,50 @@ class Database:
                 return new_attempts
             except Exception as e:
                 print(f"[DB] Supabase otp_increment_attempts error: {e}")
-                if self.is_vercel:
-                    return 1
-
-        conn = self._get_sqlite_conn()
-        conn.execute("UPDATE email_otps SET attempts = attempts + 1 WHERE id = ?", (otp_id,))
-        conn.commit()
-        row = conn.execute("SELECT attempts FROM email_otps WHERE id = ?", (otp_id,)).fetchone()
-        conn.close()
-        return row["attempts"] if row else 1
+                return 1
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("UPDATE email_otps SET attempts = attempts + 1 WHERE id = ?", (otp_id,))
+            conn.commit()
+            row = conn.execute("SELECT attempts FROM email_otps WHERE id = ?", (otp_id,)).fetchone()
+            conn.close()
+            return row["attempts"] if row else 1
 
     def otp_mark_used(self, otp_id):
         """
         Marks the specified OTP record as used.
         """
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
                 self.client.table("email_otps").update({"used": True}).eq("id", otp_id).execute()
                 return True
             except Exception as e:
                 print(f"[DB] Supabase otp_mark_used error: {e}")
-                if self.is_vercel:
-                    return False
-
-        conn = self._get_sqlite_conn()
-        conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (otp_id,))
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (otp_id,))
+            conn.commit()
+            conn.close()
+            return True
 
     def otp_mark_verified(self, otp_id):
         """
         Marks the specified OTP record as verified (ready for registration/consumption).
         """
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
                 self.client.table("email_otps").update({"verified": True}).eq("id", otp_id).execute()
                 return True
             except Exception as e:
                 print(f"[DB] Supabase otp_mark_verified error: {e}")
-                if self.is_vercel:
-                    return False
-
-        conn = self._get_sqlite_conn()
-        conn.execute("UPDATE email_otps SET verified = 1 WHERE id = ?", (otp_id,))
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("UPDATE email_otps SET verified = 1 WHERE id = ?", (otp_id,))
+            conn.commit()
+            conn.close()
+            return True
 
     def otp_get_verified(self, email, role):
         """
@@ -486,7 +486,7 @@ class Database:
         email_clean = (email or "").strip().lower()
         now_dt = datetime.datetime.now(datetime.timezone.utc)
 
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
                 res = self.client.table("email_otps").select("*").eq("email", email_clean).eq("role", role).eq("verified", True).eq("used", False).order("id", desc=True).limit(1).execute()
                 if res.data:
@@ -504,28 +504,27 @@ class Database:
                 return None
             except Exception as e:
                 print(f"[DB] Supabase otp_get_verified error: {e}")
-                if self.is_vercel:
-                    return None
-
-        conn = self._get_sqlite_conn()
-        row = conn.execute(
-            "SELECT * FROM email_otps WHERE email = ? AND role = ? AND verified = 1 AND used = 0 ORDER BY id DESC LIMIT 1",
-            (email_clean, role)
-        ).fetchone()
-        conn.close()
-        if row:
-            r = dict(row)
-            exp = str(r.get("expires_at", "")).replace("Z", "+00:00")
-            try:
-                exp_dt = datetime.datetime.fromisoformat(exp)
-                if exp_dt.tzinfo is None:
-                    exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
-                if exp_dt > now_dt:
-                    return r
-            except Exception:
-                if exp > now_dt.isoformat():
-                    return r
-        return None
+                return None
+        else:
+            conn = self._get_sqlite_conn()
+            row = conn.execute(
+                "SELECT * FROM email_otps WHERE email = ? AND role = ? AND verified = 1 AND used = 0 ORDER BY id DESC LIMIT 1",
+                (email_clean, role)
+            ).fetchone()
+            conn.close()
+            if row:
+                r = dict(row)
+                exp = str(r.get("expires_at", "")).replace("Z", "+00:00")
+                try:
+                    exp_dt = datetime.datetime.fromisoformat(exp)
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+                    if exp_dt > now_dt:
+                        return r
+                except Exception:
+                    if exp > now_dt.isoformat():
+                        return r
+            return None
 
     # ------------------ Profiles / Users ------------------
     def get_user_by_email(self, email):
@@ -537,13 +536,12 @@ class Database:
                 return None
             except Exception as e:
                 print(f"[DB] Supabase error in get_user_by_email: {e}")
-                if self.is_vercel:
-                    return None
-        
-        conn = self._get_sqlite_conn()
-        user = conn.execute("SELECT * FROM profiles WHERE email = ?", (email,)).fetchone()
-        conn.close()
-        return dict(user) if user else None
+                return None
+        else:
+            conn = self._get_sqlite_conn()
+            user = conn.execute("SELECT * FROM profiles WHERE email = ?", (email,)).fetchone()
+            conn.close()
+            return dict(user) if user else None
 
     def get_user_by_id(self, user_id):
         if self.use_supabase:
@@ -554,13 +552,12 @@ class Database:
                 return None
             except Exception as e:
                 print(f"[DB] Supabase error in get_user_by_id: {e}")
-                if self.is_vercel:
-                    return None
-
-        conn = self._get_sqlite_conn()
-        user = conn.execute("SELECT * FROM profiles WHERE id = ?", (user_id,)).fetchone()
-        conn.close()
-        return dict(user) if user else None
+                return None
+        else:
+            conn = self._get_sqlite_conn()
+            user = conn.execute("SELECT * FROM profiles WHERE id = ?", (user_id,)).fetchone()
+            conn.close()
+            return dict(user) if user else None
 
     def create_user(self, user_data):
         if "id" not in user_data:
@@ -569,27 +566,33 @@ class Database:
         if self.use_supabase:
             try:
                 self.client.table("profiles").insert(user_data).execute()
+                if "role" in user_data and user_data["role"]:
+                    try:
+                        self.add_user_role(user_data["id"], user_data["role"], user_data.get("status", "active"))
+                    except Exception as e:
+                        print(f"[DB] Initial role insertion warning: {e}")
                 return user_data
             except Exception as e:
                 print(f"[DB] Supabase insert user: {e}")
                 if self.is_vercel:
                     raise e
+                return user_data
+        else:
+            conn = self._get_sqlite_conn()
+            keys = list(user_data.keys())
+            placeholders = ",".join(["?"] * len(keys))
+            columns = ",".join(keys)
+            conn.execute(f"INSERT INTO profiles ({columns}) VALUES ({placeholders})", [user_data[k] for k in keys])
+            conn.commit()
+            conn.close()
 
-        conn = self._get_sqlite_conn()
-        keys = list(user_data.keys())
-        placeholders = ",".join(["?"] * len(keys))
-        columns = ",".join(keys)
-        conn.execute(f"INSERT INTO profiles ({columns}) VALUES ({placeholders})", [user_data[k] for k in keys])
-        conn.commit()
-        conn.close()
+            if "role" in user_data and user_data["role"]:
+                try:
+                    self.add_user_role(user_data["id"], user_data["role"], user_data.get("status", "active"))
+                except Exception as e:
+                    print(f"[DB] Initial role insertion warning: {e}")
 
-        if "role" in user_data and user_data["role"]:
-            try:
-                self.add_user_role(user_data["id"], user_data["role"], user_data.get("status", "active"))
-            except Exception as e:
-                print(f"[DB] Initial role insertion warning: {e}")
-
-        return user_data
+            return user_data
 
     # ------------------ Multi-Role / Workspaces ------------------
     def get_user_roles(self, user_id):
@@ -600,27 +603,37 @@ class Database:
         if not user_id:
             return []
 
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
-                res = self.client.table("user_roles").select("role, status").eq("user_id", user_id).execute()
+                res = self.client.table("user_roles").select("role, status").eq("user_id", str(user_id)).execute()
                 if res.data:
                     return [{"role": r["role"], "status": r.get("status", "active")} for r in res.data]
+                # Fallback to profiles.role for backward compatibility
+                user = self.get_user_by_id(user_id)
+                if user and user.get("role"):
+                    return [{"role": user["role"], "status": user.get("status", "active")}]
+                return []
             except Exception as e:
                 print(f"[DB] Supabase error in get_user_roles: {e}")
-                if self.is_vercel:
+                try:
+                    user = self.get_user_by_id(user_id)
+                    if user and user.get("role"):
+                        return [{"role": user["role"], "status": user.get("status", "active")}]
+                except Exception:
                     pass
+                return []
+        else:
+            conn = self._get_sqlite_conn()
+            rows = conn.execute("SELECT role, status FROM user_roles WHERE user_id = ?", (str(user_id),)).fetchall()
+            conn.close()
+            if rows:
+                return [{"role": r["role"], "status": r["status"]} for r in rows]
 
-        conn = self._get_sqlite_conn()
-        rows = conn.execute("SELECT role, status FROM user_roles WHERE user_id = ?", (user_id,)).fetchall()
-        conn.close()
-        if rows:
-            return [{"role": r["role"], "status": r["status"]} for r in rows]
-
-        # Fallback to profiles.role for backward compatibility
-        user = self.get_user_by_id(user_id)
-        if user and user.get("role"):
-            return [{"role": user["role"], "status": user.get("status", "active")}]
-        return []
+            # Fallback to profiles.role for backward compatibility
+            user = self.get_user_by_id(user_id)
+            if user and user.get("role"):
+                return [{"role": user["role"], "status": user.get("status", "active")}]
+            return []
 
     def user_has_role(self, user_id, role):
         """
@@ -630,30 +643,40 @@ class Database:
         if not user_id or not role:
             return False
 
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
-                res = self.client.table("user_roles").select("role").eq("user_id", user_id).eq("role", role).eq("status", "active").execute()
+                res = self.client.table("user_roles").select("role").eq("user_id", str(user_id)).eq("role", role).eq("status", "active").limit(1).execute()
                 if res.data and len(res.data) > 0:
                     return True
+                # Fallback to profiles.role for backward compatibility
+                user = self.get_user_by_id(user_id)
+                if user and user.get("role") == role and user.get("status") == "active":
+                    return True
+                return False
             except Exception as e:
                 print(f"[DB] Supabase error in user_has_role: {e}")
-                if self.is_vercel:
+                try:
+                    user = self.get_user_by_id(user_id)
+                    if user and user.get("role") == role and user.get("status") == "active":
+                        return True
+                except Exception:
                     pass
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            row = conn.execute(
+                "SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND status = 'active' LIMIT 1",
+                (str(user_id), role)
+            ).fetchone()
+            conn.close()
+            if row:
+                return True
 
-        conn = self._get_sqlite_conn()
-        row = conn.execute(
-            "SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND status = 'active'",
-            (user_id, role)
-        ).fetchone()
-        conn.close()
-        if row:
-            return True
-
-        # Fallback to profiles.role for backward compatibility
-        user = self.get_user_by_id(user_id)
-        if user and user.get("role") == role and user.get("status") == "active":
-            return True
-        return False
+            # Fallback to profiles.role for backward compatibility
+            user = self.get_user_by_id(user_id)
+            if user and user.get("role") == role and user.get("status") == "active":
+                return True
+            return False
 
     def add_user_role(self, user_id, role, status="active"):
         """
@@ -664,32 +687,36 @@ class Database:
             return False
 
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        role_id = f"{user_id}_{role}"
         payload = {
-            "user_id": user_id,
+            "id": role_id,
+            "user_id": str(user_id),
             "role": role,
             "status": status,
             "created_at": now_iso
         }
 
-        if self.use_supabase and self.client:
+        if self.use_supabase:
             try:
-                self.client.table("user_roles").upsert(payload, on_conflict="user_id,role").execute()
-                return True
+                res = self.client.table("user_roles").upsert(payload, on_conflict="user_id,role").execute()
+                if res.data and len(res.data) > 0:
+                    return res.data[0]
+                return payload
             except Exception as e:
                 print(f"[DB] Supabase add_user_role error: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        role_id = f"{user_id}_{role}"
-        conn.execute("""
-            INSERT INTO user_roles (id, user_id, role, status, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, role) DO UPDATE SET status = excluded.status
-        """, (role_id, user_id, role, status, now_iso))
-        conn.commit()
-        conn.close()
-        return True
+                return payload
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("""
+                INSERT INTO user_roles (id, user_id, role, status, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, role) DO UPDATE SET status = excluded.status
+            """, (role_id, str(user_id), role, status, now_iso))
+            conn.commit()
+            conn.close()
+            return payload
 
     def get_all_users(self, role=None):
         if self.use_supabase:
@@ -701,16 +728,15 @@ class Database:
                 return res.data or []
             except Exception as e:
                 print(f"[DB] Supabase get_all_users: {e}")
-                if self.is_vercel:
-                    return []
-
-        conn = self._get_sqlite_conn()
-        if role:
-            rows = conn.execute("SELECT * FROM profiles WHERE role = ? ORDER BY created_at DESC", (role,)).fetchall()
+                return []
         else:
-            rows = conn.execute("SELECT * FROM profiles ORDER BY created_at DESC").fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+            conn = self._get_sqlite_conn()
+            if role:
+                rows = conn.execute("SELECT * FROM profiles WHERE role = ? ORDER BY created_at DESC", (role,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM profiles ORDER BY created_at DESC").fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
 
     def update_user_status(self, user_id, status):
         if self.use_supabase:
@@ -721,12 +747,13 @@ class Database:
                 print(f"[DB] Supabase update user status: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        conn.execute("UPDATE profiles SET status = ? WHERE id = ?", (status, user_id))
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("UPDATE profiles SET status = ? WHERE id = ?", (status, user_id))
+            conn.commit()
+            conn.close()
+            return True
 
     def update_user_password(self, user_id, password_hash):
         if self.use_supabase:
@@ -737,12 +764,13 @@ class Database:
                 print(f"[DB] Supabase update user password: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        conn.execute("UPDATE profiles SET password_hash = ? WHERE id = ?", (password_hash, user_id))
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("UPDATE profiles SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+            conn.commit()
+            conn.close()
+            return True
 
     # ------------------ Platform Settings ------------------
     def get_platform_settings(self):
@@ -751,25 +779,29 @@ class Database:
                 res = self.client.table("platform_settings").select("*").eq("id", 1).execute()
                 if res.data:
                     return res.data[0]
+                return {
+                    "id": 1,
+                    "produce_commission_percent": Config.DEFAULT_PRODUCE_COMMISSION,
+                    "machinery_commission_percent": Config.DEFAULT_MACHINERY_COMMISSION
+                }
             except Exception as e:
                 print(f"[DB] Supabase get_platform_settings: {e}")
-                if self.is_vercel:
-                    return {
-                        "id": 1,
-                        "produce_commission_percent": Config.DEFAULT_PRODUCE_COMMISSION,
-                        "machinery_commission_percent": Config.DEFAULT_MACHINERY_COMMISSION
-                    }
-
-        conn = self._get_sqlite_conn()
-        row = conn.execute("SELECT * FROM platform_settings WHERE id = 1").fetchone()
-        conn.close()
-        if row:
-            return dict(row)
-        return {
-            "id": 1,
-            "produce_commission_percent": Config.DEFAULT_PRODUCE_COMMISSION,
-            "machinery_commission_percent": Config.DEFAULT_MACHINERY_COMMISSION
-        }
+                return {
+                    "id": 1,
+                    "produce_commission_percent": Config.DEFAULT_PRODUCE_COMMISSION,
+                    "machinery_commission_percent": Config.DEFAULT_MACHINERY_COMMISSION
+                }
+        else:
+            conn = self._get_sqlite_conn()
+            row = conn.execute("SELECT * FROM platform_settings WHERE id = 1").fetchone()
+            conn.close()
+            if row:
+                return dict(row)
+            return {
+                "id": 1,
+                "produce_commission_percent": Config.DEFAULT_PRODUCE_COMMISSION,
+                "machinery_commission_percent": Config.DEFAULT_MACHINERY_COMMISSION
+            }
 
     def update_platform_settings(self, produce_comm, machinery_comm):
         now = datetime.datetime.utcnow().isoformat()
@@ -786,16 +818,17 @@ class Database:
                 print(f"[DB] Supabase update settings: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        conn.execute("""
-            UPDATE platform_settings 
-            SET produce_commission_percent = ?, machinery_commission_percent = ?, updated_at = ?
-            WHERE id = 1
-        """, (produce_comm, machinery_comm, now))
-        conn.commit()
-        conn.close()
-        return self.get_platform_settings()
+                return self.get_platform_settings()
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("""
+                UPDATE platform_settings 
+                SET produce_commission_percent = ?, machinery_commission_percent = ?, updated_at = ?
+                WHERE id = 1
+            """, (produce_comm, machinery_comm, now))
+            conn.commit()
+            conn.close()
+            return self.get_platform_settings()
 
     # ------------------ Products (Produce) ------------------
     def get_products(self, category=None, farmer_id=None, search=None, status=None):
@@ -822,34 +855,33 @@ class Database:
                 return items
             except Exception as e:
                 print(f"[DB] Supabase get_products: {e}")
-                if self.is_vercel:
-                    return []
+                return []
+        else:
+            conn = self._get_sqlite_conn()
+            sql = """
+                SELECT p.*, prof.full_name as farmer_name, prof.location as farmer_location 
+                FROM products p
+                LEFT JOIN profiles prof ON p.farmer_id = prof.id
+                WHERE 1=1
+            """
+            params = []
+            if category and category != 'all':
+                sql += " AND p.category = ?"
+                params.append(category)
+            if farmer_id:
+                sql += " AND p.farmer_id = ?"
+                params.append(farmer_id)
+            if status:
+                sql += " AND p.status = ?"
+                params.append(status)
+            if search:
+                sql += " AND (p.title LIKE ? OR p.description LIKE ?)"
+                params.extend([f"%{search}%", f"%{search}%"])
 
-        conn = self._get_sqlite_conn()
-        sql = """
-            SELECT p.*, prof.full_name as farmer_name, prof.location as farmer_location 
-            FROM products p
-            LEFT JOIN profiles prof ON p.farmer_id = prof.id
-            WHERE 1=1
-        """
-        params = []
-        if category and category != 'all':
-            sql += " AND p.category = ?"
-            params.append(category)
-        if farmer_id:
-            sql += " AND p.farmer_id = ?"
-            params.append(farmer_id)
-        if status:
-            sql += " AND p.status = ?"
-            params.append(status)
-        if search:
-            sql += " AND (p.title LIKE ? OR p.description LIKE ?)"
-            params.extend([f"%{search}%", f"%{search}%"])
-
-        sql += " ORDER BY p.created_at DESC"
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+            sql += " ORDER BY p.created_at DESC"
+            rows = conn.execute(sql, params).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
 
     def get_product_by_id(self, product_id):
         if self.use_supabase:
@@ -863,18 +895,17 @@ class Database:
                 return None
             except Exception as e:
                 print(f"[DB] Supabase get_product_by_id: {e}")
-                if self.is_vercel:
-                    return None
-
-        conn = self._get_sqlite_conn()
-        row = conn.execute("""
-            SELECT p.*, prof.full_name as farmer_name, prof.location as farmer_location 
-            FROM products p
-            LEFT JOIN profiles prof ON p.farmer_id = prof.id
-            WHERE p.id = ?
-        """, (product_id,)).fetchone()
-        conn.close()
-        return dict(row) if row else None
+                return None
+        else:
+            conn = self._get_sqlite_conn()
+            row = conn.execute("""
+                SELECT p.*, prof.full_name as farmer_name, prof.location as farmer_location 
+                FROM products p
+                LEFT JOIN profiles prof ON p.farmer_id = prof.id
+                WHERE p.id = ?
+            """, (product_id,)).fetchone()
+            conn.close()
+            return dict(row) if row else None
 
     def create_product(self, product_data):
         if "id" not in product_data:
@@ -888,15 +919,16 @@ class Database:
                 print(f"[DB] Supabase insert product: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        keys = list(product_data.keys())
-        placeholders = ",".join(["?"] * len(keys))
-        columns = ",".join(keys)
-        conn.execute(f"INSERT INTO products ({columns}) VALUES ({placeholders})", [product_data[k] for k in keys])
-        conn.commit()
-        conn.close()
-        return product_data
+                return product_data
+        else:
+            conn = self._get_sqlite_conn()
+            keys = list(product_data.keys())
+            placeholders = ",".join(["?"] * len(keys))
+            columns = ",".join(keys)
+            conn.execute(f"INSERT INTO products ({columns}) VALUES ({placeholders})", [product_data[k] for k in keys])
+            conn.commit()
+            conn.close()
+            return product_data
 
     def update_product(self, product_id, updates):
         if self.use_supabase:
@@ -907,14 +939,15 @@ class Database:
                 print(f"[DB] Supabase update product: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
-        values = list(updates.values()) + [product_id]
-        conn.execute(f"UPDATE products SET {set_clause} WHERE id = ?", values)
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+            values = list(updates.values()) + [product_id]
+            conn.execute(f"UPDATE products SET {set_clause} WHERE id = ?", values)
+            conn.commit()
+            conn.close()
+            return True
 
     def delete_product(self, product_id):
         if self.use_supabase:
@@ -925,12 +958,13 @@ class Database:
                 print(f"[DB] Supabase delete product: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
+            conn.commit()
+            conn.close()
+            return True
 
     # ------------------ Machinery Fleet ------------------
     def get_machinery(self, category=None, seller_id=None, search=None, available_only=False):
@@ -957,33 +991,32 @@ class Database:
                 return items
             except Exception as e:
                 print(f"[DB] Supabase get_machinery: {e}")
-                if self.is_vercel:
-                    return []
+                return []
+        else:
+            conn = self._get_sqlite_conn()
+            sql = """
+                SELECT m.*, prof.full_name as seller_name, prof.phone as seller_phone 
+                FROM machinery m
+                LEFT JOIN profiles prof ON m.seller_id = prof.id
+                WHERE 1=1
+            """
+            params = []
+            if category and category != 'all':
+                sql += " AND m.category = ?"
+                params.append(category)
+            if seller_id:
+                sql += " AND m.seller_id = ?"
+                params.append(seller_id)
+            if available_only:
+                sql += " AND m.is_available = 1"
+            if search:
+                sql += " AND (m.title LIKE ? OR m.model_info LIKE ? OR m.specifications LIKE ?)"
+                params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
 
-        conn = self._get_sqlite_conn()
-        sql = """
-            SELECT m.*, prof.full_name as seller_name, prof.phone as seller_phone 
-            FROM machinery m
-            LEFT JOIN profiles prof ON m.seller_id = prof.id
-            WHERE 1=1
-        """
-        params = []
-        if category and category != 'all':
-            sql += " AND m.category = ?"
-            params.append(category)
-        if seller_id:
-            sql += " AND m.seller_id = ?"
-            params.append(seller_id)
-        if available_only:
-            sql += " AND m.is_available = 1"
-        if search:
-            sql += " AND (m.title LIKE ? OR m.model_info LIKE ? OR m.specifications LIKE ?)"
-            params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
-
-        sql += " ORDER BY m.created_at DESC"
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+            sql += " ORDER BY m.created_at DESC"
+            rows = conn.execute(sql, params).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
 
     def get_machinery_by_id(self, machinery_id):
         if self.use_supabase:
@@ -998,18 +1031,17 @@ class Database:
                 return None
             except Exception as e:
                 print(f"[DB] Supabase get_machinery_by_id: {e}")
-                if self.is_vercel:
-                    return None
-
-        conn = self._get_sqlite_conn()
-        row = conn.execute("""
-            SELECT m.*, prof.full_name as seller_name, prof.phone as seller_phone 
-            FROM machinery m
-            LEFT JOIN profiles prof ON m.seller_id = prof.id
-            WHERE m.id = ?
-        """, (machinery_id,)).fetchone()
-        conn.close()
-        return dict(row) if row else None
+                return None
+        else:
+            conn = self._get_sqlite_conn()
+            row = conn.execute("""
+                SELECT m.*, prof.full_name as seller_name, prof.phone as seller_phone 
+                FROM machinery m
+                LEFT JOIN profiles prof ON m.seller_id = prof.id
+                WHERE m.id = ?
+            """, (machinery_id,)).fetchone()
+            conn.close()
+            return dict(row) if row else None
 
     def create_machinery(self, machinery_data):
         if "id" not in machinery_data:
@@ -1023,15 +1055,16 @@ class Database:
                 print(f"[DB] Supabase insert machinery: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        keys = list(machinery_data.keys())
-        placeholders = ",".join(["?"] * len(keys))
-        columns = ",".join(keys)
-        conn.execute(f"INSERT INTO machinery ({columns}) VALUES ({placeholders})", [machinery_data[k] for k in keys])
-        conn.commit()
-        conn.close()
-        return machinery_data
+                return machinery_data
+        else:
+            conn = self._get_sqlite_conn()
+            keys = list(machinery_data.keys())
+            placeholders = ",".join(["?"] * len(keys))
+            columns = ",".join(keys)
+            conn.execute(f"INSERT INTO machinery ({columns}) VALUES ({placeholders})", [machinery_data[k] for k in keys])
+            conn.commit()
+            conn.close()
+            return machinery_data
 
     def update_machinery(self, machinery_id, updates):
         if self.use_supabase:
@@ -1042,14 +1075,15 @@ class Database:
                 print(f"[DB] Supabase update machinery: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
-        values = list(updates.values()) + [machinery_id]
-        conn.execute(f"UPDATE machinery SET {set_clause} WHERE id = ?", values)
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+            values = list(updates.values()) + [machinery_id]
+            conn.execute(f"UPDATE machinery SET {set_clause} WHERE id = ?", values)
+            conn.commit()
+            conn.close()
+            return True
 
     def delete_machinery(self, machinery_id):
         if self.use_supabase:
@@ -1060,12 +1094,13 @@ class Database:
                 print(f"[DB] Supabase delete machinery: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        conn.execute("DELETE FROM machinery WHERE id = ?", (machinery_id,))
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("DELETE FROM machinery WHERE id = ?", (machinery_id,))
+            conn.commit()
+            conn.close()
+            return True
 
     # ------------------ Orders (Produce Purchasing) ------------------
     def create_order(self, order_data, items):
@@ -1089,27 +1124,28 @@ class Database:
                 print(f"[DB] Supabase create_order: {e}")
                 if self.is_vercel:
                     raise e
+                return None
+        else:
+            conn = self._get_sqlite_conn()
+            cur = conn.cursor()
+            keys = list(order_data.keys())
+            placeholders = ",".join(["?"] * len(keys))
+            columns = ",".join(keys)
+            cur.execute(f"INSERT INTO orders ({columns}) VALUES ({placeholders})", [order_data[k] for k in keys])
 
-        conn = self._get_sqlite_conn()
-        cur = conn.cursor()
-        keys = list(order_data.keys())
-        placeholders = ",".join(["?"] * len(keys))
-        columns = ",".join(keys)
-        cur.execute(f"INSERT INTO orders ({columns}) VALUES ({placeholders})", [order_data[k] for k in keys])
+            for it in items:
+                it["order_id"] = order_id
+                if "id" not in it:
+                    it["id"] = str(uuid.uuid4())
+                ikeys = list(it.keys())
+                iplaceholders = ",".join(["?"] * len(ikeys))
+                icolumns = ",".join(ikeys)
+                cur.execute(f"INSERT INTO order_items ({icolumns}) VALUES ({iplaceholders})", [it[k] for k in ikeys])
+                cur.execute("UPDATE products SET stock_quantity = MAX(0, stock_quantity - ?) WHERE id = ?", (it["quantity"], it["product_id"]))
 
-        for it in items:
-            it["order_id"] = order_id
-            if "id" not in it:
-                it["id"] = str(uuid.uuid4())
-            ikeys = list(it.keys())
-            iplaceholders = ",".join(["?"] * len(ikeys))
-            icolumns = ",".join(ikeys)
-            cur.execute(f"INSERT INTO order_items ({icolumns}) VALUES ({iplaceholders})", [it[k] for k in ikeys])
-            cur.execute("UPDATE products SET stock_quantity = MAX(0, stock_quantity - ?) WHERE id = ?", (it["quantity"], it["product_id"]))
-
-        conn.commit()
-        conn.close()
-        return order_data
+            conn.commit()
+            conn.close()
+            return order_data
 
     def get_orders(self, customer_id=None, farmer_id=None):
         if self.use_supabase:
@@ -1146,47 +1182,46 @@ class Database:
                 return orders
             except Exception as e:
                 print(f"[DB] Supabase get_orders: {e}")
-                if self.is_vercel:
-                    return []
+                return []
+        else:
+            conn = self._get_sqlite_conn()
+            sql = """
+                SELECT o.*, c.full_name as customer_name, c.phone as customer_phone, c.email as customer_email
+                FROM orders o
+                LEFT JOIN profiles c ON o.customer_id = c.id
+                WHERE 1=1
+            """
+            params = []
+            if customer_id:
+                sql += " AND o.customer_id = ?"
+                params.append(customer_id)
 
-        conn = self._get_sqlite_conn()
-        sql = """
-            SELECT o.*, c.full_name as customer_name, c.phone as customer_phone, c.email as customer_email
-            FROM orders o
-            LEFT JOIN profiles c ON o.customer_id = c.id
-            WHERE 1=1
-        """
-        params = []
-        if customer_id:
-            sql += " AND o.customer_id = ?"
-            params.append(customer_id)
+            sql += " ORDER BY o.created_at DESC"
+            order_rows = conn.execute(sql, params).fetchall()
 
-        sql += " ORDER BY o.created_at DESC"
-        order_rows = conn.execute(sql, params).fetchall()
+            orders = []
+            for orow in order_rows:
+                o = dict(orow)
+                item_rows = conn.execute("""
+                    SELECT oi.*, p.title as product_title, p.unit, p.image_url as product_image
+                    FROM order_items oi
+                    LEFT JOIN products p ON oi.product_id = p.id
+                    WHERE oi.order_id = ?
+                """, (o["id"],)).fetchall()
+                items = [dict(it) for it in item_rows]
 
-        orders = []
-        for orow in order_rows:
-            o = dict(orow)
-            item_rows = conn.execute("""
-                SELECT oi.*, p.title as product_title, p.unit, p.image_url as product_image
-                FROM order_items oi
-                LEFT JOIN products p ON oi.product_id = p.id
-                WHERE oi.order_id = ?
-            """, (o["id"],)).fetchall()
-            items = [dict(it) for it in item_rows]
+                if farmer_id:
+                    farmer_items = [it for it in items if it.get("farmer_id") == farmer_id]
+                    if not farmer_items:
+                        continue
+                    o["farmer_items"] = farmer_items
+                    o["farmer_total_earnings"] = sum(it.get("farmer_earnings", 0) for it in farmer_items)
 
-            if farmer_id:
-                farmer_items = [it for it in items if it.get("farmer_id") == farmer_id]
-                if not farmer_items:
-                    continue
-                o["farmer_items"] = farmer_items
-                o["farmer_total_earnings"] = sum(it.get("farmer_earnings", 0) for it in farmer_items)
+                o["items"] = items
+                orders.append(o)
 
-            o["items"] = items
-            orders.append(o)
-
-        conn.close()
-        return orders
+            conn.close()
+            return orders
 
     def update_order_status(self, order_id, status):
         if self.use_supabase:
@@ -1197,12 +1232,13 @@ class Database:
                 print(f"[DB] Supabase update order status: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+            conn.commit()
+            conn.close()
+            return True
 
     # ------------------ Machinery Rental Bookings ------------------
     def create_booking(self, booking_data):
@@ -1217,15 +1253,16 @@ class Database:
                 print(f"[DB] Supabase insert booking: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        keys = list(booking_data.keys())
-        placeholders = ",".join(["?"] * len(keys))
-        columns = ",".join(keys)
-        conn.execute(f"INSERT INTO rental_bookings ({columns}) VALUES ({placeholders})", [booking_data[k] for k in keys])
-        conn.commit()
-        conn.close()
-        return booking_data
+                return None
+        else:
+            conn = self._get_sqlite_conn()
+            keys = list(booking_data.keys())
+            placeholders = ",".join(["?"] * len(keys))
+            columns = ",".join(keys)
+            conn.execute(f"INSERT INTO rental_bookings ({columns}) VALUES ({placeholders})", [booking_data[k] for k in keys])
+            conn.commit()
+            conn.close()
+            return booking_data
 
     def get_bookings(self, customer_id=None, seller_id=None):
         if self.use_supabase:
@@ -1250,33 +1287,32 @@ class Database:
                 return items
             except Exception as e:
                 print(f"[DB] Supabase get_bookings: {e}")
-                if self.is_vercel:
-                    return []
+                return []
+        else:
+            conn = self._get_sqlite_conn()
+            sql = """
+                SELECT rb.*, 
+                       c.full_name as customer_name, c.phone as customer_phone,
+                       m.title as machinery_title, m.category as machinery_category, m.image_url as machinery_image,
+                       s.full_name as seller_name, s.phone as seller_phone
+                FROM rental_bookings rb
+                LEFT JOIN profiles c ON rb.customer_id = c.id
+                LEFT JOIN machinery m ON rb.machinery_id = m.id
+                LEFT JOIN profiles s ON rb.seller_id = s.id
+                WHERE 1=1
+            """
+            params = []
+            if customer_id:
+                sql += " AND rb.customer_id = ?"
+                params.append(customer_id)
+            if seller_id:
+                sql += " AND rb.seller_id = ?"
+                params.append(seller_id)
 
-        conn = self._get_sqlite_conn()
-        sql = """
-            SELECT rb.*, 
-                   c.full_name as customer_name, c.phone as customer_phone,
-                   m.title as machinery_title, m.category as machinery_category, m.image_url as machinery_image,
-                   s.full_name as seller_name, s.phone as seller_phone
-            FROM rental_bookings rb
-            LEFT JOIN profiles c ON rb.customer_id = c.id
-            LEFT JOIN machinery m ON rb.machinery_id = m.id
-            LEFT JOIN profiles s ON rb.seller_id = s.id
-            WHERE 1=1
-        """
-        params = []
-        if customer_id:
-            sql += " AND rb.customer_id = ?"
-            params.append(customer_id)
-        if seller_id:
-            sql += " AND rb.seller_id = ?"
-            params.append(seller_id)
-
-        sql += " ORDER BY rb.created_at DESC"
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+            sql += " ORDER BY rb.created_at DESC"
+            rows = conn.execute(sql, params).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
 
     def update_booking_status(self, booking_id, status):
         if self.use_supabase:
@@ -1287,12 +1323,13 @@ class Database:
                 print(f"[DB] Supabase update booking status: {e}")
                 if self.is_vercel:
                     raise e
-
-        conn = self._get_sqlite_conn()
-        conn.execute("UPDATE rental_bookings SET status = ? WHERE id = ?", (status, booking_id))
-        conn.commit()
-        conn.close()
-        return True
+                return False
+        else:
+            conn = self._get_sqlite_conn()
+            conn.execute("UPDATE rental_bookings SET status = ? WHERE id = ?", (status, booking_id))
+            conn.commit()
+            conn.close()
+            return True
 
     # ------------------ Super Admin Metrics & Ledger ------------------
     def get_admin_metrics(self):
@@ -1343,74 +1380,73 @@ class Database:
                 }
             except Exception as e:
                 print(f"[DB] Supabase get_admin_metrics: {e}")
-                if self.is_vercel:
-                    return {
-                        "total_platform_turnover": 0.0,
-                        "total_admin_commission": 0.0,
-                        "produce_sales_volume": 0.0,
-                        "produce_commission_earned": 0.0,
-                        "machinery_rental_volume": 0.0,
-                        "machinery_commission_earned": 0.0,
-                        "total_customers": 0,
-                        "total_farmers": 0,
-                        "total_sellers": 0,
-                        "total_users": 1,
-                        "total_products": 0,
-                        "total_machinery": 0,
-                        "total_orders": 0,
-                        "total_bookings": 0
-                    }
+                return {
+                    "total_platform_turnover": 0.0,
+                    "total_admin_commission": 0.0,
+                    "produce_sales_volume": 0.0,
+                    "produce_commission_earned": 0.0,
+                    "machinery_rental_volume": 0.0,
+                    "machinery_commission_earned": 0.0,
+                    "total_customers": 0,
+                    "total_farmers": 0,
+                    "total_sellers": 0,
+                    "total_users": 1,
+                    "total_products": 0,
+                    "total_machinery": 0,
+                    "total_orders": 0,
+                    "total_bookings": 0
+                }
+        else:
+            conn = self._get_sqlite_conn()
+            cur = conn.cursor()
 
-        conn = self._get_sqlite_conn()
-        cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM profiles WHERE role = 'customer'")
+            total_customers = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM profiles WHERE role = 'customer'")
-        total_customers = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM profiles WHERE role = 'farmer'")
+            total_farmers = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM profiles WHERE role = 'farmer'")
-        total_farmers = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM profiles WHERE role = 'machinery_seller'")
+            total_sellers = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM profiles WHERE role = 'machinery_seller'")
-        total_sellers = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM products")
+            total_products = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM products")
-        total_products = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM machinery")
+            total_machinery = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM machinery")
-        total_machinery = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COALESCE(SUM(total_commission), 0) FROM orders")
+            order_stats = cur.fetchone()
+            total_orders = order_stats[0]
+            produce_sales_volume = float(order_stats[1])
+            produce_commission_earned = float(order_stats[2])
 
-        cur.execute("SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COALESCE(SUM(total_commission), 0) FROM orders")
-        order_stats = cur.fetchone()
-        total_orders = order_stats[0]
-        produce_sales_volume = float(order_stats[1])
-        produce_commission_earned = float(order_stats[2])
+            cur.execute("SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COALESCE(SUM(commission_amount), 0) FROM rental_bookings")
+            booking_stats = cur.fetchone()
+            total_bookings = booking_stats[0]
+            machinery_rental_volume = float(booking_stats[1])
+            machinery_commission_earned = float(booking_stats[2])
 
-        cur.execute("SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COALESCE(SUM(commission_amount), 0) FROM rental_bookings")
-        booking_stats = cur.fetchone()
-        total_bookings = booking_stats[0]
-        machinery_rental_volume = float(booking_stats[1])
-        machinery_commission_earned = float(booking_stats[2])
+            total_platform_turnover = produce_sales_volume + machinery_rental_volume
+            total_admin_commission = produce_commission_earned + machinery_commission_earned
 
-        total_platform_turnover = produce_sales_volume + machinery_rental_volume
-        total_admin_commission = produce_commission_earned + machinery_commission_earned
+            conn.close()
 
-        conn.close()
-
-        return {
-            "total_platform_turnover": round(total_platform_turnover, 2),
-            "total_admin_commission": round(total_admin_commission, 2),
-            "produce_sales_volume": round(produce_sales_volume, 2),
-            "produce_commission_earned": round(produce_commission_earned, 2),
-            "machinery_rental_volume": round(machinery_rental_volume, 2),
-            "machinery_commission_earned": round(machinery_commission_earned, 2),
-            "total_customers": total_customers,
-            "total_farmers": total_farmers,
-            "total_sellers": total_sellers,
-            "total_users": total_customers + total_farmers + total_sellers + 1,
-            "total_products": total_products,
-            "total_machinery": total_machinery,
-            "total_orders": total_orders,
-            "total_bookings": total_bookings
-        }
+            return {
+                "total_platform_turnover": round(total_platform_turnover, 2),
+                "total_admin_commission": round(total_admin_commission, 2),
+                "produce_sales_volume": round(produce_sales_volume, 2),
+                "produce_commission_earned": round(produce_commission_earned, 2),
+                "machinery_rental_volume": round(machinery_rental_volume, 2),
+                "machinery_commission_earned": round(machinery_commission_earned, 2),
+                "total_customers": total_customers,
+                "total_farmers": total_farmers,
+                "total_sellers": total_sellers,
+                "total_users": total_customers + total_farmers + total_sellers + 1,
+                "total_products": total_products,
+                "total_machinery": total_machinery,
+                "total_orders": total_orders,
+                "total_bookings": total_bookings
+            }
 
 db = Database()

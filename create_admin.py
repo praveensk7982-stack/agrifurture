@@ -110,7 +110,7 @@ def main():
                 }).eq("email", email).execute()
             except Exception as e:
                 print(f"[Supabase Admin Update Error] {e}")
-        if not db.use_supabase or not db.is_vercel:
+        else:
             conn = db._get_sqlite_conn()
             try:
                 conn.execute(

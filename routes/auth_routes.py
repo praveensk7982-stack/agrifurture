@@ -314,34 +314,38 @@ def login():
     _clear_failures(email)
 
     # Check requested workspace role
-    if role:
-        if not db.user_has_role(user["id"], role):
+    try:
+        if role:
+            if not db.user_has_role(user["id"], role):
+                user_roles = db.get_user_roles(user["id"])
+                active_roles = [r["role"] for r in user_roles if r.get("status") == "active"]
+                return jsonify({
+                    "error": f"You don't have a {role} workspace yet. Sign in and add it.",
+                    "code": "role_missing",
+                    "roles": active_roles,
+                    "requested_role": role
+                }), 403
+            active_role = role
+        else:
             user_roles = db.get_user_roles(user["id"])
             active_roles = [r["role"] for r in user_roles if r.get("status") == "active"]
-            return jsonify({
-                "error": f"You don't have a {role} workspace yet. Sign in and add it.",
-                "code": "role_missing",
-                "roles": active_roles,
-                "requested_role": role
-            }), 403
-        active_role = role
-    else:
-        user_roles = db.get_user_roles(user["id"])
-        active_roles = [r["role"] for r in user_roles if r.get("status") == "active"]
-        active_role = user.get("role") if user.get("role") in active_roles else (active_roles[0] if active_roles else "customer")
+            active_role = user.get("role") if user.get("role") in active_roles else (active_roles[0] if active_roles else "customer")
 
-    session.clear()
-    session["user_id"] = user["id"]
-    session["active_role"] = active_role
-    session["role"] = active_role
-    session.permanent = True
+        session.clear()
+        session["user_id"] = user["id"]
+        session["active_role"] = active_role
+        session["role"] = active_role
+        session.permanent = True
 
-    return jsonify({
-        "message": "Login successful!",
-        "user": _safe(user),
-        "roles": db.get_user_roles(user["id"]),
-        "active_role": active_role
-    }), 200
+        return jsonify({
+            "message": "Login successful!",
+            "user": _safe(user),
+            "roles": db.get_user_roles(user["id"]),
+            "active_role": active_role
+        }), 200
+    except Exception as exc:
+        print(f"[AUTH LOGIN ROLE ERROR] {type(exc).__name__}: {str(exc)}")
+        return jsonify({"error": f"Failed to verify workspace roles: {type(exc).__name__} - {str(exc)}"}), 500
 
 
 # ===================================================================
@@ -374,27 +378,31 @@ def add_workspace_role():
     if not check_password_hash(user.get("password_hash", ""), password):
         return jsonify({"error": "Incorrect password."}), 401
 
-    # If the role already exists (and is active), return 200 with current roles
-    if db.user_has_role(user_id, role):
+    try:
+        # If the role already exists (and is active), return 200 with current roles
+        if db.user_has_role(user_id, role):
+            session["active_role"] = role
+            session["role"] = role
+            return jsonify({
+                "message": f"You already have the {role} workspace.",
+                "roles": db.get_user_roles(user_id),
+                "active_role": role
+            }), 200
+
+        # Farmer and machinery_seller roles are added as "active" for now
+        # TODO: Admin approval can be added here for farmer/machinery_seller if needed in the future.
+        db.add_user_role(user_id, role, status="active")
         session["active_role"] = role
         session["role"] = role
+
         return jsonify({
-            "message": f"You already have the {role} workspace.",
+            "message": f"{role.replace('_', ' ').title()} workspace added successfully.",
             "roles": db.get_user_roles(user_id),
             "active_role": role
         }), 200
-
-    # Farmer and machinery_seller roles are added as "active" for now
-    # TODO: Admin approval can be added here for farmer/machinery_seller if needed in the future.
-    db.add_user_role(user_id, role, status="active")
-    session["active_role"] = role
-    session["role"] = role
-
-    return jsonify({
-        "message": f"{role.replace('_', ' ').title()} workspace added successfully.",
-        "roles": db.get_user_roles(user_id),
-        "active_role": role
-    }), 200
+    except Exception as exc:
+        print(f"[AUTH ADD ROLE ERROR] {type(exc).__name__}: {str(exc)}")
+        return jsonify({"error": f"Failed to add workspace role: {type(exc).__name__} - {str(exc)}"}), 500
 
 
 @auth_bp.route("/api/auth/switch-role", methods=["POST"])
@@ -407,18 +415,22 @@ def switch_workspace_role():
     if not role:
         return jsonify({"error": "Role is required."}), 400
 
-    # Verify that the user has that role active in user_roles
-    if not db.user_has_role(user_id, role):
-        return jsonify({"error": f"You do not have access to the {role} workspace."}), 403
+    try:
+        # Verify that the user has that role active in user_roles
+        if not db.user_has_role(user_id, role):
+            return jsonify({"error": f"You do not have access to the {role} workspace."}), 403
 
-    session["active_role"] = role
-    session["role"] = role
+        session["active_role"] = role
+        session["role"] = role
 
-    return jsonify({
-        "message": f"Switched to {role.replace('_', ' ').title()} workspace.",
-        "active_role": role,
-        "roles": db.get_user_roles(user_id)
-    }), 200
+        return jsonify({
+            "message": f"Switched to {role.replace('_', ' ').title()} workspace.",
+            "active_role": role,
+            "roles": db.get_user_roles(user_id)
+        }), 200
+    except Exception as exc:
+        print(f"[AUTH SWITCH ROLE ERROR] {type(exc).__name__}: {str(exc)}")
+        return jsonify({"error": f"Failed to switch workspace role: {type(exc).__name__} - {str(exc)}"}), 500
 
 
 # ===================================================================
