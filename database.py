@@ -13,131 +13,6 @@ except ImportError:
     HAS_SUPABASE_LIB = False
 
 
-class SupabaseOtpCursor:
-    def __init__(self, data=None, lastrowid=None):
-        self._data = data or []
-        self._index = 0
-        self.lastrowid = lastrowid
-
-    def fetchone(self):
-        if self._index < len(self._data):
-            row = self._data[self._index]
-            self._index += 1
-            return row
-        return None
-
-    def fetchall(self):
-        remaining = self._data[self._index:]
-        self._index = len(self._data)
-        return remaining
-
-
-class SupabaseOtpConnection:
-    """
-    Proxy connection providing a SQLite-compatible interface for email_otps
-    routing directly to Supabase PostgreSQL in production without local filesystem writes.
-    """
-    def __init__(self, supabase_client, fallback_db_path=":memory:"):
-        self.client = supabase_client
-        self.fallback_db_path = fallback_db_path
-        self._fallback_conn = None
-
-    def _get_fallback(self):
-        if not self._fallback_conn:
-            self._fallback_conn = sqlite3.connect(self.fallback_db_path)
-            self._fallback_conn.row_factory = sqlite3.Row
-            self._fallback_conn.execute("""
-                CREATE TABLE IF NOT EXISTS email_otps (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    email TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    otp_hash TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    used INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL
-                );
-            """)
-            self._fallback_conn.commit()
-        return self._fallback_conn
-
-    def execute(self, sql, params=()):
-        clean_sql = " ".join(sql.strip().split())
-        upper_sql = clean_sql.upper()
-
-        if "EMAIL_OTPS" in upper_sql and self.client:
-            try:
-                # 1. SELECT created_at
-                if upper_sql.startswith("SELECT CREATED_AT FROM EMAIL_OTPS"):
-                    query = self.client.table("email_otps").select("created_at").eq("email", params[0])
-                    if len(params) >= 3:
-                        query = query.eq("role", params[1]).gt("created_at", params[2])
-                    elif len(params) == 2:
-                        query = query.gt("created_at", params[1])
-                    res = query.order("id", desc=True).execute()
-                    rows = [dict(r) for r in (res.data or [])]
-                    return SupabaseOtpCursor(rows)
-
-                # 2. UPDATE email_otps SET used = 1
-                elif upper_sql.startswith("UPDATE EMAIL_OTPS SET USED = 1"):
-                    if "WHERE ID = ?" in upper_sql:
-                        self.client.table("email_otps").update({"used": 1}).eq("id", params[0]).execute()
-                    elif len(params) >= 2:
-                        self.client.table("email_otps").update({"used": 1}).eq("email", params[0]).eq("role", params[1]).eq("used", 0).execute()
-                    elif len(params) == 1:
-                        self.client.table("email_otps").update({"used": 1}).eq("email", params[0]).eq("used", 0).execute()
-                    return SupabaseOtpCursor()
-
-                # 3. UPDATE email_otps SET attempts = attempts + 1
-                elif upper_sql.startswith("UPDATE EMAIL_OTPS SET ATTEMPTS = ATTEMPTS + 1"):
-                    otp_id = params[0]
-                    res = self.client.table("email_otps").select("attempts").eq("id", otp_id).execute()
-                    att = (res.data[0].get("attempts") or 0) if res.data else 0
-                    self.client.table("email_otps").update({"attempts": att + 1}).eq("id", otp_id).execute()
-                    return SupabaseOtpCursor()
-
-                # 4. INSERT INTO email_otps
-                elif upper_sql.startswith("INSERT INTO EMAIL_OTPS"):
-                    payload = {
-                        "email": params[0],
-                        "role": params[1],
-                        "otp_hash": params[2],
-                        "expires_at": params[3],
-                        "created_at": params[4],
-                        "attempts": 0,
-                        "used": 0
-                    }
-                    res = self.client.table("email_otps").insert(payload).execute()
-                    last_id = res.data[0].get("id") if res.data else 1
-                    return SupabaseOtpCursor(lastrowid=last_id)
-
-                # 5. SELECT * FROM email_otps
-                elif upper_sql.startswith("SELECT * FROM EMAIL_OTPS"):
-                    query = self.client.table("email_otps").select("*").eq("email", params[0])
-                    if len(params) >= 2:
-                        query = query.eq("role", params[1])
-                    if "USED = 0" in upper_sql:
-                        query = query.eq("used", 0)
-                    res = query.order("id", desc=True).limit(1).execute()
-                    rows = [dict(r) for r in (res.data or [])]
-                    return SupabaseOtpCursor(rows)
-
-            except Exception as e:
-                print(f"[SupabaseOtpConnection] Falling back to memory: {e}")
-                return self._get_fallback().execute(sql, params)
-
-        return self._get_fallback().execute(sql, params)
-
-    def commit(self):
-        if self._fallback_conn:
-            self._fallback_conn.commit()
-
-    def close(self):
-        if self._fallback_conn:
-            self._fallback_conn.close()
-            self._fallback_conn = None
-
-
 class Database:
     def __init__(self):
         self.is_vercel = bool(os.getenv("VERCEL"))
@@ -171,9 +46,6 @@ class Database:
             self._init_sqlite()
 
     def _get_sqlite_conn(self):
-        if self.use_supabase and self.client:
-            fallback = ":memory:" if self.is_vercel else self.db_path
-            return SupabaseOtpConnection(self.client, fallback)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
@@ -205,6 +77,7 @@ class Database:
             expires_at TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             used INTEGER NOT NULL DEFAULT 0,
+            verified INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
 
@@ -303,6 +176,11 @@ class Database:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """)
+
+        try:
+            cur.execute("ALTER TABLE email_otps ADD COLUMN verified INTEGER DEFAULT 0")
+        except Exception:
+            pass
         
         # Check if profiles table is empty in SQLite; seed only in debug mode
         cur.execute("SELECT COUNT(*) FROM profiles")
@@ -360,6 +238,266 @@ class Database:
         INSERT INTO rental_bookings (id, booking_number, customer_id, machinery_id, seller_id, rental_type, start_datetime, end_datetime, duration_units, rate_applied, with_operator, operator_fee, total_amount, commission_amount, seller_payout, delivery_location, notes, status, payment_status)
         VALUES ('0b111111-1111-1111-1111-111111111111', 'RN-2026-701', '44444444-4444-4444-4444-444444444444', 'f1111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 'hourly', '2026-09-12 09:00:00', '2026-09-12 14:00:00', 5.0, 650.00, 1, 750.00, 4000.00, 400.00, 3600.00, 'Survey Plot 88, Khed Shivapur, Pune', 'Need tractor for pre-monsoon rotavator ploughing.', 'approved', 'paid')
         """)
+
+    # ================== OTP Helper Methods ==================
+    def otp_recent_requests(self, email, role=None, since_iso=None):
+        """
+        Returns recent OTP request rows for an email (and optional role) created after since_iso,
+        ordered newest first.
+        """
+        email_clean = (email or "").strip().lower()
+        if self.use_supabase and self.client:
+            try:
+                query = self.client.table("email_otps").select("id, created_at").eq("email", email_clean)
+                if role:
+                    query = query.eq("role", role)
+                if since_iso:
+                    query = query.gt("created_at", since_iso)
+                res = query.order("id", desc=True).execute()
+                return res.data or []
+            except Exception as e:
+                print(f"[DB] Supabase otp_recent_requests error: {e}")
+                if self.is_vercel:
+                    return []
+
+        conn = self._get_sqlite_conn()
+        sql = "SELECT id, created_at FROM email_otps WHERE email = ?"
+        params = [email_clean]
+        if role:
+            sql += " AND role = ?"
+            params.append(role)
+        if since_iso:
+            sql += " AND created_at > ?"
+            params.append(since_iso)
+        sql += " ORDER BY id DESC"
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def otp_invalidate_unused(self, email, role=None):
+        """
+        Marks unused OTPs for this email (and optional role) as used.
+        """
+        email_clean = (email or "").strip().lower()
+        if self.use_supabase and self.client:
+            try:
+                query = self.client.table("email_otps").update({"used": True}).eq("email", email_clean).eq("used", False)
+                if role:
+                    query = query.eq("role", role)
+                query.execute()
+                return True
+            except Exception as e:
+                print(f"[DB] Supabase otp_invalidate_unused error: {e}")
+                if self.is_vercel:
+                    return False
+
+        conn = self._get_sqlite_conn()
+        if role:
+            conn.execute("UPDATE email_otps SET used = 1 WHERE email = ? AND role = ? AND used = 0", (email_clean, role))
+        else:
+            conn.execute("UPDATE email_otps SET used = 1 WHERE email = ? AND used = 0", (email_clean,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def otp_insert(self, email, role, otp_hash, expires_at, created_at):
+        """
+        Inserts a new OTP entry and returns the inserted row dictionary with id.
+        """
+        email_clean = (email or "").strip().lower()
+        payload = {
+            "email": email_clean,
+            "role": role,
+            "otp_hash": otp_hash,
+            "expires_at": expires_at,
+            "created_at": created_at,
+            "attempts": 0,
+            "used": False,
+            "verified": False
+        }
+        if self.use_supabase and self.client:
+            try:
+                res = self.client.table("email_otps").insert(payload).execute()
+                if res.data:
+                    return res.data[0]
+            except Exception as e:
+                print(f"[DB] Supabase otp_insert error: {e}")
+                if self.is_vercel:
+                    raise e
+
+        conn = self._get_sqlite_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO email_otps (email, role, otp_hash, expires_at, created_at, attempts, used, verified)
+               VALUES (?, ?, ?, ?, ?, 0, 0, 0)""",
+            (email_clean, role, otp_hash, expires_at, created_at)
+        )
+        row_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        payload["id"] = row_id
+        payload["used"] = 0
+        payload["verified"] = 0
+        return payload
+
+    def otp_get_latest_valid(self, email, role):
+        """
+        Retrieves the latest unused and unexpired OTP for email and role.
+        Returns None if not found or expired.
+        """
+        email_clean = (email or "").strip().lower()
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+
+        if self.use_supabase and self.client:
+            try:
+                res = self.client.table("email_otps").select("*").eq("email", email_clean).eq("role", role).eq("used", False).order("id", desc=True).limit(1).execute()
+                if res.data:
+                    row = res.data[0]
+                    exp = str(row.get("expires_at", "")).replace("Z", "+00:00")
+                    try:
+                        exp_dt = datetime.datetime.fromisoformat(exp)
+                        if exp_dt.tzinfo is None:
+                            exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+                        if exp_dt > now_dt:
+                            return row
+                    except Exception:
+                        if exp > now_dt.isoformat():
+                            return row
+                return None
+            except Exception as e:
+                print(f"[DB] Supabase otp_get_latest_valid error: {e}")
+                if self.is_vercel:
+                    return None
+
+        conn = self._get_sqlite_conn()
+        row = conn.execute(
+            "SELECT * FROM email_otps WHERE email = ? AND role = ? AND used = 0 ORDER BY id DESC LIMIT 1",
+            (email_clean, role)
+        ).fetchone()
+        conn.close()
+        if row:
+            r = dict(row)
+            exp = str(r.get("expires_at", "")).replace("Z", "+00:00")
+            try:
+                exp_dt = datetime.datetime.fromisoformat(exp)
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+                if exp_dt > now_dt:
+                    return r
+            except Exception:
+                if exp > now_dt.isoformat():
+                    return r
+        return None
+
+    def otp_increment_attempts(self, otp_id):
+        """
+        Increments attempts count for the OTP with otp_id and returns the new attempts integer.
+        """
+        if self.use_supabase and self.client:
+            try:
+                res = self.client.table("email_otps").select("attempts").eq("id", otp_id).execute()
+                current = (res.data[0].get("attempts") or 0) if res.data else 0
+                new_attempts = current + 1
+                self.client.table("email_otps").update({"attempts": new_attempts}).eq("id", otp_id).execute()
+                return new_attempts
+            except Exception as e:
+                print(f"[DB] Supabase otp_increment_attempts error: {e}")
+                if self.is_vercel:
+                    return 1
+
+        conn = self._get_sqlite_conn()
+        conn.execute("UPDATE email_otps SET attempts = attempts + 1 WHERE id = ?", (otp_id,))
+        conn.commit()
+        row = conn.execute("SELECT attempts FROM email_otps WHERE id = ?", (otp_id,)).fetchone()
+        conn.close()
+        return row["attempts"] if row else 1
+
+    def otp_mark_used(self, otp_id):
+        """
+        Marks the specified OTP record as used.
+        """
+        if self.use_supabase and self.client:
+            try:
+                self.client.table("email_otps").update({"used": True}).eq("id", otp_id).execute()
+                return True
+            except Exception as e:
+                print(f"[DB] Supabase otp_mark_used error: {e}")
+                if self.is_vercel:
+                    return False
+
+        conn = self._get_sqlite_conn()
+        conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (otp_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def otp_mark_verified(self, otp_id):
+        """
+        Marks the specified OTP record as verified (ready for registration/consumption).
+        """
+        if self.use_supabase and self.client:
+            try:
+                self.client.table("email_otps").update({"verified": True}).eq("id", otp_id).execute()
+                return True
+            except Exception as e:
+                print(f"[DB] Supabase otp_mark_verified error: {e}")
+                if self.is_vercel:
+                    return False
+
+        conn = self._get_sqlite_conn()
+        conn.execute("UPDATE email_otps SET verified = 1 WHERE id = ?", (otp_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def otp_get_verified(self, email, role):
+        """
+        Retrieves a verified, unused, and unexpired OTP for email and role (used by register).
+        Returns None if not verified or expired.
+        """
+        email_clean = (email or "").strip().lower()
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+
+        if self.use_supabase and self.client:
+            try:
+                res = self.client.table("email_otps").select("*").eq("email", email_clean).eq("role", role).eq("verified", True).eq("used", False).order("id", desc=True).limit(1).execute()
+                if res.data:
+                    row = res.data[0]
+                    exp = str(row.get("expires_at", "")).replace("Z", "+00:00")
+                    try:
+                        exp_dt = datetime.datetime.fromisoformat(exp)
+                        if exp_dt.tzinfo is None:
+                            exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+                        if exp_dt > now_dt:
+                            return row
+                    except Exception:
+                        if exp > now_dt.isoformat():
+                            return row
+                return None
+            except Exception as e:
+                print(f"[DB] Supabase otp_get_verified error: {e}")
+                if self.is_vercel:
+                    return None
+
+        conn = self._get_sqlite_conn()
+        row = conn.execute(
+            "SELECT * FROM email_otps WHERE email = ? AND role = ? AND verified = 1 AND used = 0 ORDER BY id DESC LIMIT 1",
+            (email_clean, role)
+        ).fetchone()
+        conn.close()
+        if row:
+            r = dict(row)
+            exp = str(r.get("expires_at", "")).replace("Z", "+00:00")
+            try:
+                exp_dt = datetime.datetime.fromisoformat(exp)
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+                if exp_dt > now_dt:
+                    return r
+            except Exception:
+                if exp > now_dt.isoformat():
+                    return r
+        return None
 
     # ------------------ Profiles / Users ------------------
     def get_user_by_email(self, email):

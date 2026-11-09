@@ -24,9 +24,15 @@ const API = {
 
     try {
       const response = await fetch(endpoint, config);
-      const data = await response.json();
+      let data = {};
+      try {
+        data = await response.json();
+      } catch (e) {
+        // Fallback for non-JSON responses
+      }
       if (!response.ok) {
-        throw new Error(data.error || `HTTP error ${response.status}`);
+        const msg = (typeof data.error === 'string' ? data.error : data.error?.message) || data.message || response.statusText || `HTTP error ${response.status}`;
+        throw new Error(msg);
       }
       return data;
     } catch (err) {

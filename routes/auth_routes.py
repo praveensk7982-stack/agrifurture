@@ -1,5 +1,6 @@
 from functools import wraps
 import re
+import hmac
 import uuid
 import time
 import secrets
@@ -78,110 +79,103 @@ def role_required(*allowed_roles):
 
 @auth_bp.route("/api/auth/signup/send-otp", methods=["POST"])
 def signup_send_otp():
-    data = request.get_json() or {}
-    email = str(data.get("email", "")).strip().lower()
-    role = str(data.get("role", "")).strip().lower()
-
-    # Reject super_admin self-registration
-    if role == "super_admin":
-        return jsonify({"error": "Admin accounts cannot be self-registered."}), 403
-
-    if role not in ["customer", "farmer", "machinery_seller"]:
-        return jsonify({"error": "Invalid role specified."}), 400
-
-    if not EMAIL_RE.match(email):
-        return jsonify({"error": "Please enter a valid email address."}), 400
-
-    # Duplicate check: email already exists
-    existing = db.get_user_by_email(email)
-    if existing:
-        return jsonify({"error": "An account with this email already exists. Please sign in."}), 409
-
-    now = _now()
-    conn = db._get_sqlite_conn()
-    otp_role = f"signup_{role}"
     try:
-        rows = conn.execute(
-            "SELECT created_at FROM email_otps WHERE email = ? AND role = ? AND created_at > ? ORDER BY id DESC",
-            (email, otp_role, (now - datetime.timedelta(hours=1)).isoformat()),
-        ).fetchall()
+        data = request.get_json(silent=True) or {}
+        email = str(data.get("email", "")).strip().lower()
+        role = str(data.get("role", "")).strip().lower()
+
+        # Reject super_admin self-registration
+        if role == "super_admin":
+            return jsonify({"error": "Admin accounts cannot be self-registered."}), 403
+
+        if role not in ["customer", "farmer", "machinery_seller"]:
+            return jsonify({"error": "Invalid role specified."}), 400
+
+        if not EMAIL_RE.match(email):
+            return jsonify({"error": "Please enter a valid email address."}), 400
+
+        # Duplicate check: email already exists
+        existing = db.get_user_by_email(email)
+        if existing:
+            return jsonify({"error": "An account with this email already exists. Please sign in."}), 409
+
+        now = _now()
+        otp_role = f"signup_{role}"
+        since_iso = (now - datetime.timedelta(hours=1)).isoformat()
+        rows = db.otp_recent_requests(email, otp_role, since_iso)
         if rows:
-            last = datetime.datetime.fromisoformat(rows[0]["created_at"])
+            created_str = str(rows[0]["created_at"]).replace("Z", "+00:00")
+            try:
+                last = datetime.datetime.fromisoformat(created_str)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=datetime.timezone.utc)
+            except Exception:
+                last = now
             if (now - last).total_seconds() < RESEND_SECONDS:
                 return jsonify({"error": f"Please wait {RESEND_SECONDS} seconds before requesting another OTP."}), 429
             if len(rows) >= MAX_SENDS_PER_HOUR:
                 return jsonify({"error": "Too many OTP requests. Please try again in an hour."}), 429
 
         otp = f"{secrets.randbelow(10 ** 6):06d}"
-        conn.execute("UPDATE email_otps SET used = 1 WHERE email = ? AND role = ? AND used = 0", (email, otp_role))
-        cur = conn.execute(
-            "INSERT INTO email_otps (email, role, otp_hash, expires_at, created_at) VALUES (?,?,?,?,?)",
-            (
-                email,
-                otp_role,
-                _hash_otp(email, otp_role, otp),
-                (now + datetime.timedelta(minutes=Config.OTP_TTL_MINUTES)).isoformat(),
-                now.isoformat(),
-            ),
-        )
-        otp_id = cur.lastrowid
-        conn.commit()
+        db.otp_invalidate_unused(email, otp_role)
+        otp_hash = _hash_otp(email, otp_role, otp)
+        expires_at = (now + datetime.timedelta(minutes=Config.OTP_TTL_MINUTES)).isoformat()
+        new_row = db.otp_insert(email, otp_role, otp_hash, expires_at, now.isoformat())
+        otp_id = new_row.get("id") if new_row else None
 
         try:
             _send_mail(email, otp)
         except Exception as e:
             print(f"[Signup OTP] Mail error: {e}")
-            conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (otp_id,))
-            conn.commit()
+            if otp_id:
+                db.otp_mark_used(otp_id)
             return jsonify({"error": "Could not send verification email. Please try again."}), 500
-    finally:
-        conn.close()
 
-    return jsonify({"message": f"Verification OTP sent to {email}."}), 200
+        return jsonify({"message": f"Verification OTP sent to {email}."}), 200
+
+    except Exception as exc:
+        import traceback
+        print(f"[Signup send-otp Error] {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        return jsonify({"error": "Failed to send verification code. Please try again."}), 500
 
 
 @auth_bp.route("/api/auth/signup/verify-otp", methods=["POST"])
 def signup_verify_otp():
-    data = request.get_json() or {}
-    email = str(data.get("email", "")).strip().lower()
-    role = str(data.get("role", "")).strip().lower()
-    otp = str(data.get("otp", "")).strip()
-
-    if role == "super_admin":
-        return jsonify({"error": "Admin accounts cannot be self-registered."}), 403
-
-    if role not in ["customer", "farmer", "machinery_seller"] or not EMAIL_RE.match(email) or not re.fullmatch(r"\d{6}", otp):
-        return jsonify({"error": "Valid email, role, and 6-digit OTP are required."}), 400
-
-    otp_role = f"signup_{role}"
-    now = _now()
-    conn = db._get_sqlite_conn()
-    import hmac
     try:
-        rec = conn.execute(
-            "SELECT * FROM email_otps WHERE email = ? AND role = ? AND used = 0 ORDER BY id DESC LIMIT 1",
-            (email, otp_role),
-        ).fetchone()
-        if (
-            not rec
-            or datetime.datetime.fromisoformat(rec["expires_at"]) < now
-            or rec["attempts"] >= MAX_ATTEMPTS
-        ):
+        data = request.get_json() or {}
+        email = str(data.get("email", "")).strip().lower()
+        role = str(data.get("role", "")).strip().lower()
+        otp = str(data.get("otp", "")).strip()
+
+        if role == "super_admin":
+            return jsonify({"error": "Admin accounts cannot be self-registered."}), 403
+
+        if role not in ["customer", "farmer", "machinery_seller"] or not EMAIL_RE.match(email) or not re.fullmatch(r"\d{6}", otp):
+            return jsonify({"error": "Valid email, role, and 6-digit OTP are required."}), 400
+
+        otp_role = f"signup_{role}"
+        rec = db.otp_get_latest_valid(email, otp_role)
+
+        if not rec or rec.get("attempts", 0) >= MAX_ATTEMPTS:
             return jsonify({"error": "OTP expired or invalid. Please request a new code."}), 400
 
-        conn.execute("UPDATE email_otps SET attempts = attempts + 1 WHERE id = ?", (rec["id"],))
+        new_attempts = db.otp_increment_attempts(rec["id"])
         if not hmac.compare_digest(rec["otp_hash"], _hash_otp(email, otp_role, otp)):
-            conn.commit()
-            left = MAX_ATTEMPTS - rec["attempts"] - 1
+            left = max(0, MAX_ATTEMPTS - new_attempts)
+            if left == 0:
+                db.otp_mark_used(rec["id"])
             return jsonify({"error": f"Wrong OTP. {left} attempt(s) left."}), 400
 
-        # Mark OTP as successfully verified
-        conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (rec["id"],))
-        conn.commit()
-    finally:
-        conn.close()
+        # Mark OTP as successfully verified!
+        db.otp_mark_verified(rec["id"])
+        return jsonify({"message": "Email verified successfully!", "verified": True}), 200
 
-    return jsonify({"message": "Email verified successfully!", "verified": True}), 200
+    except Exception as exc:
+        import traceback
+        print(f"[Signup verify-otp Error] {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        return jsonify({"error": "Verification failed. Please try again."}), 500
 
 
 @auth_bp.route("/api/auth/register", methods=["POST"])
@@ -216,26 +210,18 @@ def register():
     if existing:
         return jsonify({"error": "An account with this email already exists."}), 409
 
-    # Verify that an OTP was verified or passed
+    # Register must return 403 unless the email was OTP-verified
     otp_role = f"signup_{role}"
-    now = _now()
-    conn = db._get_sqlite_conn()
-    import hmac
-    try:
-        if otp and re.fullmatch(r"\d{6}", otp):
-            # Check unused or recently verified OTP
-            rec = conn.execute(
-                "SELECT * FROM email_otps WHERE email = ? AND role = ? ORDER BY id DESC LIMIT 1",
-                (email, otp_role),
-            ).fetchone()
-            if rec and rec["used"] == 0:
-                if (datetime.datetime.fromisoformat(rec["expires_at"]) < now or
-                        not hmac.compare_digest(rec["otp_hash"], _hash_otp(email, otp_role, otp))):
-                    return jsonify({"error": "Invalid or expired verification code."}), 400
-                conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (rec["id"],))
-                conn.commit()
-    finally:
-        conn.close()
+    verified_rec = db.otp_get_verified(email, otp_role)
+
+    # Fallback if user passed otp directly in payload and was not verified yet
+    if not verified_rec and otp and re.fullmatch(r"\d{6}", otp):
+        latest = db.otp_get_latest_valid(email, otp_role)
+        if latest and hmac.compare_digest(latest["otp_hash"], _hash_otp(email, otp_role, otp)):
+            verified_rec = latest
+
+    if not verified_rec:
+        return jsonify({"error": "Email verification is required before creating an account."}), 403
 
     new_user = {
         "id": str(uuid.uuid4()),
@@ -251,6 +237,10 @@ def register():
     }
 
     db.create_user(new_user)
+
+    # Mark OTP as used so it cannot be reused
+    if verified_rec and verified_rec.get("id"):
+        db.otp_mark_used(verified_rec["id"])
 
     session.clear()
     session["user_id"] = new_user["id"]
@@ -346,32 +336,25 @@ def admin_verify_credentials():
 
     # Generate Admin OTP for Step 2 (Session NOT created yet!)
     now = _now()
-    conn = db._get_sqlite_conn()
-    try:
-        otp = f"{secrets.randbelow(10 ** 6):06d}"
-        conn.execute("UPDATE email_otps SET used = 1 WHERE email = ? AND role = 'super_admin' AND used = 0", (email,))
-        cur = conn.execute(
-            "INSERT INTO email_otps (email, role, otp_hash, expires_at, created_at) VALUES (?,?,?,?,?)",
-            (
-                email,
-                "super_admin",
-                _hash_otp(email, "super_admin", otp),
-                (now + datetime.timedelta(minutes=Config.OTP_TTL_MINUTES)).isoformat(),
-                now.isoformat(),
-            ),
-        )
-        otp_id = cur.lastrowid
-        conn.commit()
+    otp = f"{secrets.randbelow(10 ** 6):06d}"
+    db.otp_invalidate_unused(email, "super_admin")
+    expires_at = (now + datetime.timedelta(minutes=Config.OTP_TTL_MINUTES)).isoformat()
+    new_row = db.otp_insert(
+        email=email,
+        role="super_admin",
+        otp_hash=_hash_otp(email, "super_admin", otp),
+        expires_at=expires_at,
+        created_at=now.isoformat(),
+    )
+    otp_id = new_row.get("id") if new_row else None
 
-        try:
-            _send_mail(email, otp)
-        except Exception as e:
-            print(f"[Admin OTP] Mail error: {e}")
-            conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (otp_id,))
-            conn.commit()
-            return jsonify({"error": "Could not send authorization email. Please try again."}), 500
-    finally:
-        conn.close()
+    try:
+        _send_mail(email, otp)
+    except Exception as e:
+        print(f"[Admin OTP] Mail error: {e}")
+        if otp_id:
+            db.otp_mark_used(otp_id)
+        return jsonify({"error": "Could not send authorization email. Please try again."}), 500
 
     return jsonify({
         "message": "Credentials verified. 6-digit authorization code sent to admin email.",
@@ -401,32 +384,17 @@ def admin_verify_otp():
         _record_failure(email)
         return jsonify({"error": "Invalid or expired authorization code."}), 401
 
-    now = _now()
-    conn = db._get_sqlite_conn()
-    import hmac
-    try:
-        rec = conn.execute(
-            "SELECT * FROM email_otps WHERE email = ? AND role = 'super_admin' AND used = 0 ORDER BY id DESC LIMIT 1",
-            (email,),
-        ).fetchone()
-        if (
-            not rec
-            or datetime.datetime.fromisoformat(rec["expires_at"]) < now
-            or rec["attempts"] >= MAX_ATTEMPTS
-        ):
-            _record_failure(email)
-            return jsonify({"error": "Invalid or expired authorization code."}), 401
+    rec = db.otp_get_latest_valid(email, "super_admin")
+    if not rec or rec.get("attempts", 0) >= MAX_ATTEMPTS:
+        _record_failure(email)
+        return jsonify({"error": "Invalid or expired authorization code."}), 401
 
-        conn.execute("UPDATE email_otps SET attempts = attempts + 1 WHERE id = ?", (rec["id"],))
-        if not hmac.compare_digest(rec["otp_hash"], _hash_otp(email, "super_admin", otp)):
-            conn.commit()
-            _record_failure(email)
-            return jsonify({"error": "Invalid or expired authorization code."}), 401
+    db.otp_increment_attempts(rec["id"])
+    if not hmac.compare_digest(rec["otp_hash"], _hash_otp(email, "super_admin", otp)):
+        _record_failure(email)
+        return jsonify({"error": "Invalid or expired authorization code."}), 401
 
-        conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (rec["id"],))
-        conn.commit()
-    finally:
-        conn.close()
+    db.otp_mark_used(rec["id"])
 
     # Success: Create admin session
     _clear_failures(email)
@@ -481,43 +449,40 @@ def forgot_password_send_otp():
         return jsonify({"error": "This account has been suspended."}), 403
 
     now = _now()
-    conn = db._get_sqlite_conn()
-    try:
-        rows = conn.execute(
-            "SELECT created_at FROM email_otps WHERE email = ? AND role = 'reset' AND created_at > ? ORDER BY id DESC",
-            (email, (now - datetime.timedelta(hours=1)).isoformat()),
-        ).fetchall()
-        if rows:
-            last = datetime.datetime.fromisoformat(rows[0]["created_at"])
-            if (now - last).total_seconds() < RESEND_SECONDS:
-                return jsonify({"error": f"Please wait {RESEND_SECONDS} seconds before requesting another OTP."}), 429
-            if len(rows) >= MAX_SENDS_PER_HOUR:
-                return jsonify({"error": "Too many OTP requests. Please try again in an hour."}), 429
-
-        otp = f"{secrets.randbelow(10 ** 6):06d}"
-        conn.execute("UPDATE email_otps SET used = 1 WHERE email = ? AND role = 'reset' AND used = 0", (email,))
-        cur = conn.execute(
-            "INSERT INTO email_otps (email, role, otp_hash, expires_at, created_at) VALUES (?,?,?,?,?)",
-            (
-                email,
-                "reset",
-                _hash_otp(email, "reset", otp),
-                (now + datetime.timedelta(minutes=Config.OTP_TTL_MINUTES)).isoformat(),
-                now.isoformat(),
-            ),
-        )
-        otp_id = cur.lastrowid
-        conn.commit()
-
+    since_iso = (now - datetime.timedelta(hours=1)).isoformat()
+    rows = db.otp_recent_requests(email, "reset", since_iso)
+    if rows:
+        created_str = str(rows[0]["created_at"]).replace("Z", "+00:00")
         try:
-            _send_mail(email, otp)
-        except Exception as e:
-            print(f"[Forgot Password] Mail error: {e}")
-            conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (otp_id,))
-            conn.commit()
-            return jsonify({"error": "Could not send the OTP email. Please try again."}), 500
-    finally:
-        conn.close()
+            last = datetime.datetime.fromisoformat(created_str)
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=datetime.timezone.utc)
+        except Exception:
+            last = now
+        if (now - last).total_seconds() < RESEND_SECONDS:
+            return jsonify({"error": f"Please wait {RESEND_SECONDS} seconds before requesting another OTP."}), 429
+        if len(rows) >= MAX_SENDS_PER_HOUR:
+            return jsonify({"error": "Too many OTP requests. Please try again in an hour."}), 429
+
+    otp = f"{secrets.randbelow(10 ** 6):06d}"
+    db.otp_invalidate_unused(email, "reset")
+    expires_at = (now + datetime.timedelta(minutes=Config.OTP_TTL_MINUTES)).isoformat()
+    new_row = db.otp_insert(
+        email=email,
+        role="reset",
+        otp_hash=_hash_otp(email, "reset", otp),
+        expires_at=expires_at,
+        created_at=now.isoformat(),
+    )
+    otp_id = new_row.get("id") if new_row else None
+
+    try:
+        _send_mail(email, otp)
+    except Exception as e:
+        print(f"[Forgot Password] Mail error: {e}")
+        if otp_id:
+            db.otp_mark_used(otp_id)
+        return jsonify({"error": "Could not send the OTP email. Please try again."}), 500
 
     return jsonify({"message": "Password reset OTP sent to your email."}), 200
 
@@ -540,31 +505,16 @@ def forgot_password_reset():
     if not user:
         return jsonify({"error": "No account found with this email."}), 404
 
-    now = _now()
-    conn = db._get_sqlite_conn()
-    import hmac
-    try:
-        rec = conn.execute(
-            "SELECT * FROM email_otps WHERE email = ? AND role = 'reset' AND used = 0 ORDER BY id DESC LIMIT 1",
-            (email,),
-        ).fetchone()
-        if (
-            not rec
-            or datetime.datetime.fromisoformat(rec["expires_at"]) < now
-            or rec["attempts"] >= MAX_ATTEMPTS
-        ):
-            return jsonify({"error": "OTP expired or invalid. Please request a new one."}), 400
+    rec = db.otp_get_latest_valid(email, "reset")
+    if not rec or rec.get("attempts", 0) >= MAX_ATTEMPTS:
+        return jsonify({"error": "OTP expired or invalid. Please request a new one."}), 400
 
-        conn.execute("UPDATE email_otps SET attempts = attempts + 1 WHERE id = ?", (rec["id"],))
-        if not hmac.compare_digest(rec["otp_hash"], _hash_otp(email, "reset", otp)):
-            conn.commit()
-            left = MAX_ATTEMPTS - rec["attempts"] - 1
-            return jsonify({"error": f"Wrong OTP. {left} attempt(s) left."}), 400
+    new_attempts = db.otp_increment_attempts(rec["id"])
+    if not hmac.compare_digest(rec["otp_hash"], _hash_otp(email, "reset", otp)):
+        left = max(0, MAX_ATTEMPTS - new_attempts)
+        return jsonify({"error": f"Wrong OTP. {left} attempt(s) left."}), 400
 
-        conn.execute("UPDATE email_otps SET used = 1 WHERE id = ?", (rec["id"],))
-        conn.commit()
-    finally:
-        conn.close()
+    db.otp_mark_used(rec["id"])
 
     # Update password
     new_hash = generate_password_hash(new_password)
