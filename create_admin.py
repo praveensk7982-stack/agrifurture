@@ -3,9 +3,10 @@
 CLI Script: create_admin.py
 Sets up or updates a Super Admin account for AGRO FUTURE.
 Security:
+- Never hardcodes credentials. Prompts for email and password at runtime.
 - Email must match one of the whitelisted emails in ADMIN_EMAILS (.env).
-- Passwords are securely hashed with scrypt (generate_password_hash).
-- Supports interactive input (with masked password via getpass) and CLI args.
+- Passwords are securely hashed with generate_password_hash (werkzeug).
+- Writes to Supabase when configured, or local SQLite with user confirmation.
 """
 
 import sys
@@ -13,13 +14,15 @@ import os
 import re
 import uuid
 import getpass
-import argparse
 import datetime
+from dotenv import load_dotenv
 
-# Ensure project root is in sys.path
+# Ensure project root is in sys.path and load .env
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
+
+load_dotenv(os.path.join(PROJECT_DIR, ".env"))
 
 from config import Config
 from database import db
@@ -37,113 +40,132 @@ def validate_password(password):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Create or update an AGRO FUTURE Super Admin account.")
-    parser.add_argument("--email", help="Super Admin email address (must be in ADMIN_EMAILS whitelist)")
-    parser.add_argument("--password", help="Super Admin password (min 8 chars, letters + numbers)")
-    parser.add_argument("--name", default="Super Admin", help="Full name of administrator")
-    parser.add_argument("--phone", default="", help="Optional contact phone")
-    args = parser.parse_args()
-
-    allowed_admin_emails = [e.lower() for e in Config.ADMIN_EMAILS]
-    if not allowed_admin_emails:
-        print("[ERROR] No ADMIN_EMAILS configured in .env. Please set ADMIN_EMAILS first.")
-        sys.exit(1)
-
-    print("==================================================")
-    print("      AGRO FUTURE - Super Admin CLI Setup         ")
-    print("==================================================")
-    print(f"Whitelisted Admin Emails (.env): {', '.join(allowed_admin_emails)}\n")
-
-    # 1. Obtain email
-    email = args.email
-    if not email:
+    # 1. Target Database Selection & Confirmation
+    if db.use_supabase:
+        db_name = "Supabase (Live PostgreSQL)"
+        print(f"Target Database: {db_name}")
+    else:
+        db_name = f"Local SQLite ({os.path.basename(Config.SQLITE_PATH)})"
+        print("Supabase credentials not configured or inactive.")
+        print(f"Target Database: {db_name}")
         try:
-            email = input("Enter admin email address: ").strip().lower()
+            confirm_sqlite = input("Use local SQLite database? (y/n): ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             print("\nAborted.")
-            sys.exit(1)
-    else:
-        email = email.strip().lower()
+            sys.exit(0)
+        if confirm_sqlite != "y":
+            print("Aborted.")
+            sys.exit(0)
 
-    if not EMAIL_RE.match(email):
-        print(f"[ERROR] '{email}' is not a valid email address.")
+    try:
+        confirm = input(f"Writing to {db_name}. Continue? (y/n): ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\nAborted.")
+        sys.exit(0)
+
+    if confirm != "y":
+        print("Aborted.")
+        sys.exit(0)
+
+    # 2. Prompt for admin email and password (asked twice)
+    try:
+        email = input("Enter admin email: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\nAborted.")
+        sys.exit(0)
+
+    # 3. Validation
+    if not email or not EMAIL_RE.match(email):
+        print(f"Error: '{email}' is not a valid email address.")
+        sys.exit(1)
+
+    allowed_admin_emails = [e.lower() for e in Config.ADMIN_EMAILS if e.strip()]
+    if not allowed_admin_emails:
+        print("Error: No ADMIN_EMAILS configured in environment. Please set ADMIN_EMAILS in .env first.")
         sys.exit(1)
 
     if email not in allowed_admin_emails:
-        print(f"[ERROR] '{email}' is NOT in the ADMIN_EMAILS whitelist.")
-        print(f"Allowed emails: {', '.join(allowed_admin_emails)}")
+        print(f"Error: '{email}' is not authorized. Only emails listed in ADMIN_EMAILS are allowed.")
         sys.exit(1)
 
-    # 2. Obtain password
-    password = args.password
-    if not password:
-        try:
-            password = getpass.getpass("Enter admin password: ")
-            confirm = getpass.getpass("Confirm admin password: ")
-        except (KeyboardInterrupt, EOFError):
-            print("\nAborted.")
-            sys.exit(1)
+    try:
+        password = getpass.getpass("Enter admin password: ")
+        confirm_pwd = getpass.getpass("Confirm admin password: ")
+    except (KeyboardInterrupt, EOFError):
+        print("\nAborted.")
+        sys.exit(0)
 
-        if password != confirm:
-            print("[ERROR] Passwords do not match.")
-            sys.exit(1)
+    if password != confirm_pwd:
+        print("Error: Passwords do not match.")
+        sys.exit(1)
 
     is_valid, msg = validate_password(password)
     if not is_valid:
-        print(f"[ERROR] {msg}")
+        print(f"Error: {msg}")
         sys.exit(1)
 
-    # 3. Hash password
-    password_hash = generate_password_hash(password)
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if len(password) < 12:
+        print("Warning: Password is shorter than 12 characters (recommended: 12+ characters).")
 
-    # 4. Check if profile exists
+    # 4. Hash password with werkzeug generate_password_hash
+    password_hash = generate_password_hash(password)
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # Check if a profile with that email exists
     existing = db.get_user_by_email(email)
     if existing:
-        print(f"Updating existing account '{email}' to Super Admin...")
+        try:
+            update_confirm = input(f"Profile for '{email}' already exists. Update password and role to super_admin? (y/n): ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            sys.exit(0)
+
+        if update_confirm != "y":
+            print("Aborted.")
+            sys.exit(0)
+
+        user_id = existing["id"]
         if db.use_supabase:
             try:
                 db.client.table("profiles").update({
                     "password_hash": password_hash,
                     "role": "super_admin",
                     "status": "active"
-                }).eq("email", email).execute()
+                }).eq("id", user_id).execute()
             except Exception as e:
                 print(f"[Supabase Admin Update Error] {e}")
+                sys.exit(1)
         else:
             conn = db._get_sqlite_conn()
             try:
                 conn.execute(
-                    "UPDATE profiles SET password_hash = ?, role = 'super_admin', status = 'active' WHERE email = ?",
-                    (password_hash, email)
+                    "UPDATE profiles SET password_hash = ?, role = 'super_admin', status = 'active' WHERE id = ?",
+                    (password_hash, user_id)
                 )
                 conn.commit()
             finally:
                 conn.close()
-        db.add_user_role(existing["id"], "super_admin", "active")
-        print(f"[OK] Successfully updated Super Admin account for {email}!")
     else:
-        print(f"Creating new Super Admin profile for '{email}'...")
         user_id = str(uuid.uuid4())
-        full_name = args.name or "Super Admin"
         new_profile = {
             "id": user_id,
             "email": email,
             "password_hash": password_hash,
-            "full_name": full_name,
-            "phone": args.phone or "",
+            "full_name": "Administrator",
+            "phone": "",
             "role": "super_admin",
             "status": "active",
             "location": "Headquarters",
             "avatar_url": f"https://api.dicebear.com/7.x/bottts/svg?seed={email}",
-            "created_at": now
+            "created_at": now_iso
         }
         db.create_user(new_profile)
-        db.add_user_role(user_id, "super_admin", "active")
-        print(f"[OK] Successfully created Super Admin account for {email} (ID: {user_id})!")
 
-    print("\nAdministrator is ready to log in via the 2-step verification flow.")
-    print("==================================================")
+    # 5. Make sure active row exists in user_roles (db helper never sends "id" to Supabase)
+    db.add_user_role(user_id, "super_admin", status="active")
+
+    # 6. Print only "Admin account ready for <email>" at the end
+    print(f"Admin account ready for {email}")
 
 
 if __name__ == "__main__":

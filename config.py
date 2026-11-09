@@ -30,7 +30,7 @@ class Config:
     # Email OTP login
     MAIL_USERNAME = os.getenv("MAIL_USERNAME")
     MAIL_APP_PASSWORD = os.getenv("MAIL_APP_PASSWORD")
-    ADMIN_EMAILS = [e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "admin@agrofuture.com").split(",") if e.strip()]
+    ADMIN_EMAILS = [e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()]
     OTP_TTL_MINUTES = 5
 
     # Session cookie safety: HttpOnly, Secure, SameSite=Lax for production

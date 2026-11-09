@@ -295,14 +295,17 @@ def login():
     if _is_rate_limited(email):
         return jsonify({"error": "Too many failed login attempts. Please try again after 5 minutes."}), 429
 
-    # If role is super_admin, route to 2-step admin login
-    if role == "super_admin":
+    # If role is super_admin or email in ADMIN_EMAILS, route to 2-step admin login
+    if role == "super_admin" or email in Config.ADMIN_EMAILS:
         return admin_verify_credentials()
 
     user = db.get_user_by_email(email)
     if not user:
         _record_failure(email)
         return jsonify({"error": "Invalid email or password."}), 401
+
+    if user.get("role") == "super_admin":
+        return admin_verify_credentials()
 
     if not check_password_hash(user.get("password_hash", ""), password):
         _record_failure(email)
