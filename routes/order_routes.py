@@ -8,7 +8,7 @@ from routes.auth_routes import login_required, role_required
 order_bp = Blueprint("order_bp", __name__)
 
 @order_bp.route("/api/orders", methods=["POST"])
-@login_required
+@role_required("customer", "super_admin")
 def place_order():
     data = request.get_json() or {}
     items_data = data.get("items", [])
@@ -91,20 +91,20 @@ def place_order():
 @login_required
 def list_orders():
     user_id = session.get("user_id")
-    user_role = session.get("role")
-    role_param = request.args.get("role")
+    active_role = session.get("active_role") or session.get("role")
 
-    # Enforce RBAC: users cannot access panels for other roles
-    if role_param and role_param != user_role and user_role != "super_admin":
-        return jsonify({"error": "Forbidden: You cannot view orders for other roles."}), 403
+    if not active_role:
+        return jsonify({"error": "Forbidden: No active workspace."}), 403
 
-    effective_role = role_param or user_role
-
-    if effective_role == "farmer":
+    if active_role == "farmer":
+        if not db.user_has_role(user_id, "farmer"):
+            return jsonify({"error": "Forbidden: You do not have the farmer workspace."}), 403
         orders = db.get_orders(farmer_id=user_id)
-    elif effective_role == "customer":
+    elif active_role == "customer":
+        if not db.user_has_role(user_id, "customer"):
+            return jsonify({"error": "Forbidden: You do not have the customer workspace."}), 403
         orders = db.get_orders(customer_id=user_id)
-    elif effective_role == "super_admin":
+    elif active_role == "super_admin":
         f_id = request.args.get("farmer_id")
         c_id = request.args.get("customer_id")
         orders = db.get_orders(farmer_id=f_id, customer_id=c_id)

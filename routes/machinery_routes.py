@@ -36,10 +36,10 @@ def get_machinery_item(machinery_id):
 @role_required("machinery_seller", "super_admin")
 def create_machinery_item():
     user_id = session.get("user_id")
-    user_role = session.get("role")
+    active_role = session.get("active_role") or session.get("role")
 
     data = request.get_json() or {}
-    if user_role == "super_admin" and data.get("seller_id"):
+    if active_role == "super_admin" and data.get("seller_id"):
         seller_id = data.get("seller_id")
     else:
         seller_id = user_id
@@ -92,8 +92,8 @@ def update_machinery_item(machinery_id):
         return jsonify({"error": "Machinery not found."}), 404
 
     user_id = session.get("user_id")
-    user_role = session.get("role")
-    if user_role == "machinery_seller" and existing.get("seller_id") != user_id:
+    active_role = session.get("active_role") or session.get("role")
+    if active_role == "machinery_seller" and existing.get("seller_id") != user_id:
         return jsonify({"error": "You do not have permission to update this machinery."}), 403
 
     data = request.get_json() or {}
@@ -126,8 +126,8 @@ def delete_machinery_item(machinery_id):
         return jsonify({"error": "Machinery not found."}), 404
 
     user_id = session.get("user_id")
-    user_role = session.get("role")
-    if user_role == "machinery_seller" and existing.get("seller_id") != user_id:
+    active_role = session.get("active_role") or session.get("role")
+    if active_role == "machinery_seller" and existing.get("seller_id") != user_id:
         return jsonify({"error": "You do not have permission to delete this machinery."}), 403
 
     db.delete_machinery(machinery_id)

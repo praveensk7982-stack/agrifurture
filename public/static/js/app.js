@@ -517,6 +517,8 @@ async function handlePanelLogin(event, role) {
       loginTime: new Date()
     };
     AppState.currentUser = user;
+    AppState.userRoles = res.roles || [{ role, status: "active" }];
+    AppState.activeRole = res.active_role || role;
 
     showAuthSuccess(role, "Welcome Back!", `Accessing ${formatRole(role)} panel...`, () => {
       closeAuthModal(role);
@@ -524,12 +526,64 @@ async function handlePanelLogin(event, role) {
       switchToPanel(role);
     });
   } catch (err) {
-    showAuthError(role, err.message || "Invalid email or password.", `authPassword-${role}`);
+    if (err.code === "role_missing") {
+      const errEl = document.getElementById(`authError-${role}`);
+      if (errEl) {
+        errEl.innerHTML = `
+          <div style="font-weight:600; margin-bottom:4px; color:#b45309;">Workspace Not Found</div>
+          <div style="font-size:0.8rem; margin-bottom:10px; color:#595959;">You don't have a ${formatRole(role)} workspace yet. Sign in and add it to your account.</div>
+          <button type="button" class="btn-primary" style="width:100%; padding:8px 12px; font-size:0.84rem;" onclick="handleAddWorkspaceFromLogin('${role}', '${email.replace(/'/g, "\\'")}')">
+            + Add ${formatRole(role)} Workspace
+          </button>
+        `;
+        errEl.style.display = "block";
+      }
+    } else {
+      showAuthError(role, err.message || "Invalid email or password.", `authPassword-${role}`);
+    }
   } finally {
     if (submitBtn) {
       submitBtn.disabled = false;
       submitBtn.innerHTML = origBtnText;
     }
+  }
+}
+
+async function handleAddWorkspaceFromLogin(role, email) {
+  const passwordEl = document.getElementById(`authPassword-${role}`);
+  const password = passwordEl ? passwordEl.value : "";
+  const errEl = document.getElementById(`authError-${role}`);
+
+  if (!password) {
+    if (passwordEl) {
+      passwordEl.focus();
+      showAuthError(role, "Please enter your password to add this workspace.", `authPassword-${role}`);
+    }
+    return;
+  }
+
+  if (errEl) {
+    errEl.innerHTML = "⏳ Adding workspace...";
+    errEl.style.display = "block";
+  }
+
+  try {
+    // Authenticate session then add the workspace
+    const loginRes = await API.auth.login({ email, password });
+    const addRes = await API.auth.addRole(role, password);
+    const user = loginRes.user || { id: null, email, full_name: email.split("@")[0], role };
+
+    AppState.currentUser = user;
+    AppState.userRoles = addRes.roles || [{ role, status: "active" }];
+    AppState.activeRole = role;
+
+    showAuthSuccess(role, "Workspace Added!", `Welcome to ${formatRole(role)} panel...`, () => {
+      closeAuthModal(role);
+      showToast(`🎉 ${formatRole(role)} workspace added! Welcome, ${user.full_name}!`, "success");
+      switchToPanel(role);
+    });
+  } catch (err) {
+    showAuthError(role, err.message || "Failed to add workspace.", `authPassword-${role}`);
   }
 }
 
@@ -659,29 +713,47 @@ function handleAdminBackToStep1() {
 // REQUEST PANEL ACCESS
 // ===================================================================
 async function requestPanelAccess(role) {
+  // Check if active backend session matches this role or has this workspace
+  try {
+    const me = await API.auth.getMe();
+    if (me && me.authenticated && me.user) {
+      AppState.currentUser = me.user;
+      AppState.userRoles = me.roles || [{ role: me.user.role, status: "active" }];
+
+      const userRolesList = AppState.userRoles.map(r => (typeof r === "string" ? r : r.role));
+      const hasRole = userRolesList.includes(role);
+
+      if (hasRole) {
+        if (me.active_role !== role) {
+          const switchRes = await API.auth.switchRole(role);
+          if (switchRes.roles) AppState.userRoles = switchRes.roles;
+        }
+        AuthState.sessions[role] = {
+          id: me.user.id,
+          email: me.user.email,
+          name: me.user.full_name,
+          role: role,
+          loginTime: new Date()
+        };
+        AppState.activeRole = role;
+        switchToPanel(role);
+        return;
+      } else {
+        // Authenticated, but missing this workspace
+        if (role !== "super_admin") {
+          openAddWorkspaceModal(role);
+          return;
+        }
+      }
+    }
+  } catch (e) {
+    // Session check error or unauthenticated
+  }
+
   // If already logged in locally for this panel, switch directly
   if (AuthState.sessions[role]) {
     switchToPanel(role);
     return;
-  }
-
-  // Check if active backend session matches this role
-  try {
-    const me = await API.auth.getMe();
-    if (me && me.authenticated && me.user && me.user.role === role) {
-      AuthState.sessions[role] = {
-        id: me.user.id,
-        email: me.user.email,
-        name: me.user.full_name,
-        role: me.user.role,
-        loginTime: new Date()
-      };
-      AppState.currentUser = me.user;
-      switchToPanel(role);
-      return;
-    }
-  } catch (e) {
-    // Session check error or unauthenticated
   }
 
   // Otherwise open authentication modal
@@ -693,6 +765,7 @@ async function requestPanelAccess(role) {
 // ===================================================================
 function switchToPanel(role) {
   AppState.currentRole = role;
+  AppState.activeRole = role;
 
   // Hide all panels
   document.querySelectorAll(".panel-view").forEach(el => el.classList.remove("active"));
@@ -701,8 +774,10 @@ function switchToPanel(role) {
   const panelEl = document.getElementById(`panel-${role}`);
   if (panelEl) panelEl.classList.add("active");
 
-  // Update top-bar state
+  // Update top-bar state & workspace switchers
   updateTopBarState(role);
+  updateHeaderUserUI();
+  renderWorkspaceSwitchers();
 
   // Load panel data
   if (role === "customer") loadCustomerData();
@@ -712,12 +787,14 @@ function switchToPanel(role) {
 }
 
 function updateTopBarState(activeRole) {
+  const activeRoles = (AppState.userRoles || []).map(r => (typeof r === "string" ? r : r.role));
+
   document.querySelectorAll(".role-btn[data-role]").forEach(btn => {
     const r = btn.dataset.role;
     btn.classList.remove("active", "locked", "unlocked");
     if (r === activeRole) {
       btn.classList.add("active");
-    } else if (AuthState.sessions[r]) {
+    } else if (AuthState.sessions[r] || activeRoles.includes(r)) {
       btn.classList.add("unlocked");
     } else {
       btn.classList.add("locked");
@@ -726,7 +803,12 @@ function updateTopBarState(activeRole) {
 
   const logoutBtn = document.getElementById("globalLogoutBtn");
   const labelEl   = document.getElementById("panelBarLabel");
-  const session   = AuthState.sessions[activeRole];
+  const session   = AuthState.sessions[activeRole] || (AppState.currentUser ? {
+    id: AppState.currentUser.id,
+    email: AppState.currentUser.email,
+    name: AppState.currentUser.full_name,
+    role: activeRole
+  } : null);
 
   if (activeRole !== "landing" && session) {
     document.body.classList.remove("on-landing");
@@ -748,6 +830,230 @@ function updateTopBarState(activeRole) {
 }
 
 // ===================================================================
+// WORKSPACE SWITCHER & MANAGEMENT (Multi-Role Workspaces)
+// ===================================================================
+function renderWorkspaceSwitchers() {
+  const panels = ["customer", "farmer", "machinery_seller"];
+  const roleIcons = {
+    customer: "🛍️",
+    farmer: "👨‍🌾",
+    machinery_seller: "🚜",
+    super_admin: "👑"
+  };
+
+  const activeRoles = (AppState.userRoles || [])
+    .map(r => (typeof r === "string" ? r : r.role))
+    .filter(r => r !== "super_admin");
+
+  panels.forEach(pRole => {
+    const bar = document.getElementById(`workspaceSwitcher-${pRole}`);
+    if (!bar) return;
+
+    const otherOwned = activeRoles.filter(r => r !== pRole);
+    const unowned = panels.filter(r => !activeRoles.includes(r));
+
+    let html = `
+      <div class="ws-current-badge">
+        <span>Workspace:</span>
+        <span class="ws-pill">${roleIcons[pRole] || ""} ${formatRole(pRole)} Workspace</span>
+      </div>
+      <div class="ws-actions-group">
+    `;
+
+    if (otherOwned.length > 0) {
+      html += `<span class="ws-switch-label">Switch to:</span>`;
+      otherOwned.forEach(r => {
+        html += `
+          <button type="button" class="ws-btn" onclick="handleSwitchWorkspace('${r}')" title="Switch to ${formatRole(r)} workspace">
+            ${roleIcons[r] || ""} ${formatRole(r)}
+          </button>
+        `;
+      });
+    }
+
+    if (unowned.length > 0) {
+      if (unowned.length === 1) {
+        html += `
+          <button type="button" class="ws-btn-add" onclick="openAddWorkspaceModal('${unowned[0]}')">
+            ➕ Add ${formatRole(unowned[0])} Workspace
+          </button>
+        `;
+      } else {
+        html += `
+          <button type="button" class="ws-btn-add" onclick="openAddWorkspaceModal()">
+            ➕ Add Workspace
+          </button>
+        `;
+      }
+    }
+
+    html += `</div>`;
+    bar.innerHTML = html;
+  });
+}
+
+async function handleSwitchWorkspace(targetRole) {
+  try {
+    showToast(`Switching to ${formatRole(targetRole)} workspace...`, "info");
+    const res = await API.auth.switchRole(targetRole);
+    AppState.activeRole = res.active_role || targetRole;
+    if (res.roles) AppState.userRoles = res.roles;
+    if (AppState.currentUser) {
+      AuthState.sessions[targetRole] = {
+        id: AppState.currentUser.id,
+        email: AppState.currentUser.email,
+        name: AppState.currentUser.full_name,
+        role: targetRole,
+        loginTime: new Date()
+      };
+    }
+    switchToPanel(targetRole);
+    showToast(`Switched to ${formatRole(targetRole)} workspace.`, "success");
+  } catch (err) {
+    showToast(err.message || "Failed to switch workspace.", "error");
+  }
+}
+
+function openAddWorkspaceModal(role = "") {
+  const modal = document.getElementById("addWorkspaceModal");
+  if (!modal) return;
+
+  const targetRoleInput = document.getElementById("addWorkspaceTargetRole");
+  const roleSelect = document.getElementById("addWorkspaceRoleSelect");
+  const selectGroup = document.getElementById("addWorkspaceRoleSelectGroup");
+  const titleEl = document.getElementById("addWorkspaceTitle");
+  const subtitleEl = document.getElementById("addWorkspaceSubtitle");
+  const iconEl = document.getElementById("addWorkspaceIcon");
+  const passEl = document.getElementById("addWorkspacePassword");
+  const errEl = document.getElementById("addWorkspaceError");
+
+  if (errEl) {
+    errEl.style.display = "none";
+    errEl.textContent = "";
+  }
+  if (passEl) {
+    passEl.value = "";
+  }
+
+  const roleIcons = {
+    customer: "🛍️",
+    farmer: "👨‍🌾",
+    machinery_seller: "🚜"
+  };
+
+  const activeRoles = (AppState.userRoles || [])
+    .map(r => (typeof r === "string" ? r : r.role))
+    .filter(r => r !== "super_admin");
+
+  const unowned = ["customer", "farmer", "machinery_seller"].filter(r => !activeRoles.includes(r));
+  const chosenRole = role || (unowned.length > 0 ? unowned[0] : "farmer");
+
+  if (targetRoleInput) targetRoleInput.value = chosenRole;
+
+  if (roleSelect && unowned.length > 0) {
+    roleSelect.innerHTML = unowned.map(r => `
+      <option value="${r}">${roleIcons[r] || ""} ${formatRole(r)} Workspace</option>
+    `).join("");
+    roleSelect.value = chosenRole;
+  }
+
+  if (role && selectGroup) {
+    selectGroup.style.display = "none";
+  } else if (selectGroup) {
+    selectGroup.style.display = "block";
+  }
+
+  if (titleEl) {
+    titleEl.textContent = role ? `Add ${formatRole(role)} Workspace` : "Add New Workspace";
+  }
+  if (subtitleEl) {
+    subtitleEl.textContent = `Confirm your password to add this workspace to your account.`;
+  }
+  if (iconEl) {
+    iconEl.textContent = roleIcons[chosenRole] || "➕";
+  }
+
+  modal.classList.add("active");
+  if (passEl) setTimeout(() => passEl.focus(), 150);
+}
+
+function closeAddWorkspaceModal() {
+  const modal = document.getElementById("addWorkspaceModal");
+  if (modal) {
+    modal.classList.remove("active");
+    const errEl = document.getElementById("addWorkspaceError");
+    if (errEl) {
+      errEl.style.display = "none";
+      errEl.textContent = "";
+    }
+  }
+}
+
+async function submitAddWorkspace(event) {
+  event.preventDefault();
+  const targetRoleInput = document.getElementById("addWorkspaceTargetRole");
+  const roleSelect = document.getElementById("addWorkspaceRoleSelect");
+  const passwordEl = document.getElementById("addWorkspacePassword");
+  const errEl = document.getElementById("addWorkspaceError");
+  const btn = document.getElementById("addWorkspaceBtn");
+
+  const role = (targetRoleInput && targetRoleInput.value) || (roleSelect && roleSelect.value);
+  const password = passwordEl ? passwordEl.value : "";
+
+  if (!role) {
+    if (errEl) {
+      errEl.textContent = "Please select a workspace to add.";
+      errEl.style.display = "block";
+    }
+    return;
+  }
+
+  if (!password) {
+    if (errEl) {
+      errEl.textContent = "Please enter your account password.";
+      errEl.style.display = "block";
+    }
+    return;
+  }
+
+  const origBtnText = btn ? btn.innerHTML : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = "⏳ Adding workspace...";
+  }
+
+  try {
+    const res = await API.auth.addRole(role, password);
+    AppState.activeRole = res.active_role || role;
+    if (res.roles) AppState.userRoles = res.roles;
+
+    if (AppState.currentUser) {
+      AuthState.sessions[role] = {
+        id: AppState.currentUser.id,
+        email: AppState.currentUser.email,
+        name: AppState.currentUser.full_name,
+        role: role,
+        loginTime: new Date()
+      };
+    }
+
+    closeAddWorkspaceModal();
+    showToast(`🎉 ${formatRole(role)} workspace added!`, "success");
+    switchToPanel(role);
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = err.message || "Failed to add workspace. Please check your password.";
+      errEl.style.display = "block";
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = origBtnText;
+    }
+  }
+}
+
+// ===================================================================
 // LOGOUT
 // ===================================================================
 async function logoutCurrentPanel() {
@@ -763,6 +1069,8 @@ async function logoutCurrentPanel() {
     showToast(`Signed out of ${formatRole(role)} panel`, "info");
   }
   AppState.currentUser = null;
+  AppState.userRoles = [];
+  AppState.activeRole = null;
   AppState.currentRole = "landing";
   document.querySelectorAll(".panel-view").forEach(el => el.classList.remove("active"));
   const landingEl = document.getElementById("panel-landing");
@@ -1009,10 +1317,22 @@ document.addEventListener("DOMContentLoaded", async () => {
 async function loadCurrentUser() {
   try {
     const res = await API.auth.getMe();
-    if (res.user) {
+    if (res && res.authenticated && res.user) {
       AppState.currentUser = res.user;
-      AppState.currentRole = res.user.role;
+      AppState.userRoles = res.roles || [{ role: res.user.role, status: "active" }];
+      AppState.activeRole = res.active_role || res.user.role;
+      AppState.currentRole = AppState.activeRole;
+      if (AuthState.sessions) {
+        AuthState.sessions[AppState.activeRole] = {
+          id: res.user.id,
+          email: res.user.email,
+          name: res.user.full_name,
+          role: AppState.activeRole,
+          loginTime: new Date()
+        };
+      }
       updateHeaderUserUI();
+      renderWorkspaceSwitchers();
     }
   } catch (err) {
     console.error("Error fetching user:", err);
@@ -1026,7 +1346,8 @@ function updateHeaderUserUI() {
 
   if (AppState.currentUser) {
     if (nameEl) nameEl.textContent = AppState.currentUser.full_name;
-    if (roleEl) roleEl.textContent = formatRole(AppState.currentUser.role);
+    const currentActive = AppState.activeRole || AppState.currentUser.role;
+    if (roleEl) roleEl.textContent = formatRole(currentActive);
     if (avatarEl && AppState.currentUser.avatar_url) {
       avatarEl.src = AppState.currentUser.avatar_url;
     }

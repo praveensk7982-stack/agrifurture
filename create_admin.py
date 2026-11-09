@@ -120,6 +120,7 @@ def main():
                 conn.commit()
             finally:
                 conn.close()
+        db.add_user_role(existing["id"], "super_admin", "active")
         print(f"[OK] Successfully updated Super Admin account for {email}!")
     else:
         print(f"Creating new Super Admin profile for '{email}'...")
@@ -138,6 +139,7 @@ def main():
             "created_at": now
         }
         db.create_user(new_profile)
+        db.add_user_role(user_id, "super_admin", "active")
         print(f"[OK] Successfully created Super Admin account for {email} (ID: {user_id})!")
 
     print("\nAdministrator is ready to log in via the 2-step verification flow.")

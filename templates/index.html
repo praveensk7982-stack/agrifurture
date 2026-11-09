@@ -320,6 +320,8 @@
 
     <!-- ================= 1. CUSTOMER PANEL ================= -->
     <section id="panel-customer" class="panel-view">
+      <!-- Workspace Switcher Bar -->
+      <div class="workspace-switcher-bar" id="workspaceSwitcher-customer"></div>
       <!-- Customer Hero Banner -->
       <div class="hero-banner">
         <div class="hero-content">
@@ -445,6 +447,8 @@
 
     <!-- ================= 2. FARMER PANEL ================= -->
     <section id="panel-farmer" class="panel-view">
+      <!-- Workspace Switcher Bar -->
+      <div class="workspace-switcher-bar" id="workspaceSwitcher-farmer"></div>
       <!-- Farmer KPI Cards -->
       <div class="stats-grid">
         <div class="stat-card">
@@ -574,6 +578,8 @@
 
     <!-- ================= 3. MACHINERY SELLER PANEL ================= -->
     <section id="panel-machinery_seller" class="panel-view">
+      <!-- Workspace Switcher Bar -->
+      <div class="workspace-switcher-bar" id="workspaceSwitcher-machinery_seller"></div>
       <!-- Machinery Seller KPI Cards -->
       <div class="stats-grid">
         <div class="stat-card">
@@ -1681,6 +1687,42 @@
         <p class="auth-success-msg" id="authSuccessMsg-super_admin">Opening Admin Panel...</p>
       </div>
 
+    </div>
+  </div>
+
+  <!-- Modal: Add Workspace (Password Confirmation) -->
+  <div class="modal-overlay auth-modal-overlay" id="addWorkspaceModal">
+    <div class="modal-box auth-modal-box">
+      <div class="auth-modal-header">
+        <div class="auth-modal-icon" id="addWorkspaceIcon">➕</div>
+        <h3 class="auth-modal-title" id="addWorkspaceTitle">Add Workspace</h3>
+        <p class="auth-modal-subtitle" id="addWorkspaceSubtitle">Confirm your password to add this workspace to your account.</p>
+        <button type="button" class="modal-close" onclick="closeAddWorkspaceModal()">&times;</button>
+      </div>
+      <div class="auth-modal-body">
+        <form onsubmit="submitAddWorkspace(event)">
+          <input type="hidden" id="addWorkspaceTargetRole" value="">
+          <div class="form-group" id="addWorkspaceRoleSelectGroup">
+            <label class="form-label" for="addWorkspaceRoleSelect">Workspace</label>
+            <select id="addWorkspaceRoleSelect" class="form-control" onchange="document.getElementById('addWorkspaceTargetRole').value = this.value">
+              <option value="customer">🛍️ Customer / Buyer</option>
+              <option value="farmer">👨‍🌾 Farmer / Producer</option>
+              <option value="machinery_seller">🚜 Machinery Provider</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="addWorkspacePassword">Account Password</label>
+            <div class="auth-password-wrapper">
+              <input type="password" id="addWorkspacePassword" class="form-control" placeholder="Enter your current password" required autocomplete="current-password">
+              <button type="button" class="auth-eye-btn" onclick="toggleAuthPassword('addWorkspacePassword', this)">👁️</button>
+            </div>
+          </div>
+          <div class="auth-error-msg" id="addWorkspaceError" style="display:none;"></div>
+          <button type="submit" class="btn-primary auth-submit-btn" id="addWorkspaceBtn">
+            🚀 Add Workspace &amp; Switch
+          </button>
+        </form>
+      </div>
     </div>
   </div>
 

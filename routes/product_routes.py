@@ -33,11 +33,11 @@ def get_product(product_id):
 @role_required("farmer", "super_admin")
 def create_product():
     user_id = session.get("user_id")
-    user_role = session.get("role")
+    active_role = session.get("active_role") or session.get("role")
 
     data = request.get_json() or {}
     # Allow super_admin to specify farmer_id; otherwise use authenticated user_id
-    if user_role == "super_admin" and data.get("farmer_id"):
+    if active_role == "super_admin" and data.get("farmer_id"):
         farmer_id = data.get("farmer_id")
     else:
         farmer_id = user_id
@@ -91,8 +91,8 @@ def update_product(product_id):
 
     # Enforce ownership for farmers
     user_id = session.get("user_id")
-    user_role = session.get("role")
-    if user_role == "farmer" and existing.get("farmer_id") != user_id:
+    active_role = session.get("active_role") or session.get("role")
+    if active_role == "farmer" and existing.get("farmer_id") != user_id:
         return jsonify({"error": "You do not have permission to update this product."}), 403
 
     data = request.get_json() or {}
@@ -125,8 +125,8 @@ def delete_product(product_id):
         return jsonify({"error": "Product not found."}), 404
 
     user_id = session.get("user_id")
-    user_role = session.get("role")
-    if user_role == "farmer" and existing.get("farmer_id") != user_id:
+    active_role = session.get("active_role") or session.get("role")
+    if active_role == "farmer" and existing.get("farmer_id") != user_id:
         return jsonify({"error": "You do not have permission to delete this product."}), 403
 
     db.delete_product(product_id)

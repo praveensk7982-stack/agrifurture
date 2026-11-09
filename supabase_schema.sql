@@ -30,6 +30,16 @@ CREATE TABLE IF NOT EXISTS email_otps (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 1.2 User Roles Table (Multi-Role Workspaces)
+CREATE TABLE IF NOT EXISTS user_roles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
+    role VARCHAR(30) NOT NULL CHECK (role IN ('customer', 'farmer', 'machinery_seller', 'super_admin')),
+    status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'pending_approval', 'suspended')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, role)
+);
+
 -- 2. Platform Commission & Financial Settings
 CREATE TABLE IF NOT EXISTS platform_settings (
     id INTEGER PRIMARY KEY DEFAULT 1,

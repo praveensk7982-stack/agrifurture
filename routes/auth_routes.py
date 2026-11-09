@@ -63,11 +63,24 @@ def role_required(*allowed_roles):
     def decorator(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            if not session.get("user_id"):
+            user_id = session.get("user_id")
+            if not user_id:
                 return jsonify({"error": "Authentication required. Please sign in."}), 401
-            user_role = session.get("role")
-            if user_role not in allowed_roles:
+
+            active_role = session.get("active_role") or session.get("role")
+            if not active_role or active_role not in allowed_roles:
                 return jsonify({"error": "Forbidden: You do not have permission to access this resource."}), 403
+
+            # Server-side verification against user_roles (never trust client)
+            if active_role == "super_admin":
+                user = db.get_user_by_id(user_id)
+                admin_emails = [e.lower() for e in Config.ADMIN_EMAILS]
+                if not user or user.get("role") != "super_admin" or user.get("email", "").lower() not in admin_emails:
+                    return jsonify({"error": "Forbidden: Admin authorization required."}), 403
+            else:
+                if not db.user_has_role(user_id, active_role):
+                    return jsonify({"error": f"Forbidden: You do not have active access to the {active_role} workspace."}), 403
+
             return f(*args, **kwargs)
         return decorated_function
     return decorator
@@ -88,16 +101,20 @@ def signup_send_otp():
         if role == "super_admin":
             return jsonify({"error": "Admin accounts cannot be self-registered."}), 403
 
+        # Whitelisted admin emails cannot use public signup
+        if email in [e.lower() for e in Config.ADMIN_EMAILS]:
+            return jsonify({"error": "Admin accounts cannot use public registration."}), 403
+
         if role not in ["customer", "farmer", "machinery_seller"]:
             return jsonify({"error": "Invalid role specified."}), 400
 
         if not EMAIL_RE.match(email):
             return jsonify({"error": "Please enter a valid email address."}), 400
 
-        # Duplicate check: email already exists
+        # One account per email: if account already exists, tell them to sign in & add workspace
         existing = db.get_user_by_email(email)
         if existing:
-            return jsonify({"error": "An account with this email already exists. Please sign in."}), 409
+            return jsonify({"error": f"You already have an account. Sign in, then add the {role} workspace."}), 409
 
         now = _now()
         otp_role = f"signup_{role}"
@@ -180,7 +197,7 @@ def signup_verify_otp():
 
 @auth_bp.route("/api/auth/register", methods=["POST"])
 def register():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", ""))
     full_name = str(data.get("full_name", "")).strip()
@@ -192,6 +209,10 @@ def register():
     # Reject self-registration for super_admin
     if role == "super_admin":
         return jsonify({"error": "Admin accounts cannot be self-registered."}), 403
+
+    # Whitelisted admin emails cannot use public signup
+    if email in [e.lower() for e in Config.ADMIN_EMAILS]:
+        return jsonify({"error": "Admin accounts cannot use public registration."}), 403
 
     if role not in ["customer", "farmer", "machinery_seller"]:
         return jsonify({"error": "Invalid role specified."}), 400
@@ -208,7 +229,7 @@ def register():
 
     existing = db.get_user_by_email(email)
     if existing:
-        return jsonify({"error": "An account with this email already exists."}), 409
+        return jsonify({"error": f"You already have an account. Sign in, then add the {role} workspace."}), 409
 
     # Register must return 403 unless the email was OTP-verified
     otp_role = f"signup_{role}"
@@ -237,6 +258,7 @@ def register():
     }
 
     db.create_user(new_user)
+    db.add_user_role(new_user["id"], role, status="active")
 
     # Mark OTP as used so it cannot be reused
     if verified_rec and verified_rec.get("id"):
@@ -244,22 +266,25 @@ def register():
 
     session.clear()
     session["user_id"] = new_user["id"]
-    session["role"] = new_user["role"]
+    session["active_role"] = role
+    session["role"] = role
     session.permanent = True
 
     return jsonify({
         "message": f"Welcome to AGRO FUTURE, {full_name}!",
-        "user": _safe(new_user)
+        "user": _safe(new_user),
+        "roles": db.get_user_roles(new_user["id"]),
+        "active_role": role
     }), 201
 
 
 # ===================================================================
 # PUBLIC LOGIN (Customer / Farmer / Machinery Seller)
-# Rejects wrong-role logins with generic error message
+# Multi-Role: checks email + password, verifies requested workspace role
 # ===================================================================
 @auth_bp.route("/api/auth/login", methods=["POST"])
 def login():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", ""))
     role = str(data.get("role", "")).strip().lower()
@@ -283,21 +308,117 @@ def login():
         _record_failure(email)
         return jsonify({"error": "Invalid email or password."}), 401
 
-    # Role matching: strictly reject wrong-role login with generic error message
-    if role and user.get("role") != role:
-        _record_failure(email)
-        return jsonify({"error": "Invalid email or password."}), 401
-
     if user.get("status") == "suspended":
         return jsonify({"error": "This account has been suspended by the platform administrator."}), 403
 
     _clear_failures(email)
+
+    # Check requested workspace role
+    if role:
+        if not db.user_has_role(user["id"], role):
+            user_roles = db.get_user_roles(user["id"])
+            active_roles = [r["role"] for r in user_roles if r.get("status") == "active"]
+            return jsonify({
+                "error": f"You don't have a {role} workspace yet. Sign in and add it.",
+                "code": "role_missing",
+                "roles": active_roles,
+                "requested_role": role
+            }), 403
+        active_role = role
+    else:
+        user_roles = db.get_user_roles(user["id"])
+        active_roles = [r["role"] for r in user_roles if r.get("status") == "active"]
+        active_role = user.get("role") if user.get("role") in active_roles else (active_roles[0] if active_roles else "customer")
+
     session.clear()
     session["user_id"] = user["id"]
-    session["role"] = user["role"]
+    session["active_role"] = active_role
+    session["role"] = active_role
     session.permanent = True
 
-    return jsonify({"message": "Login successful!", "user": _safe(user)}), 200
+    return jsonify({
+        "message": "Login successful!",
+        "user": _safe(user),
+        "roles": db.get_user_roles(user["id"]),
+        "active_role": active_role
+    }), 200
+
+
+# ===================================================================
+# MULTI-ROLE WORKSPACE MANAGEMENT (Add Role & Switch Role)
+# ===================================================================
+@auth_bp.route("/api/auth/roles/add", methods=["POST"])
+@login_required
+def add_workspace_role():
+    user_id = session.get("user_id")
+    user = db.get_user_by_id(user_id)
+    if not user or user.get("status") == "suspended":
+        return jsonify({"error": "Account not found or suspended."}), 403
+
+    # super_admin accounts cannot add marketplace roles
+    if user.get("role") == "super_admin" or session.get("active_role") == "super_admin":
+        return jsonify({"error": "Admin accounts cannot add marketplace roles."}), 403
+
+    data = request.get_json(silent=True) or {}
+    role = str(data.get("role", "")).strip().lower()
+    password = str(data.get("password", ""))
+
+    if not role or not password:
+        return jsonify({"error": "Role and password confirmation are required."}), 400
+
+    # role must be customer, farmer or machinery_seller; NEVER super_admin
+    if role == "super_admin" or role not in ["customer", "farmer", "machinery_seller"]:
+        return jsonify({"error": "Invalid workspace role specified."}), 403
+
+    # Re-check the password
+    if not check_password_hash(user.get("password_hash", ""), password):
+        return jsonify({"error": "Incorrect password."}), 401
+
+    # If the role already exists (and is active), return 200 with current roles
+    if db.user_has_role(user_id, role):
+        session["active_role"] = role
+        session["role"] = role
+        return jsonify({
+            "message": f"You already have the {role} workspace.",
+            "roles": db.get_user_roles(user_id),
+            "active_role": role
+        }), 200
+
+    # Farmer and machinery_seller roles are added as "active" for now
+    # TODO: Admin approval can be added here for farmer/machinery_seller if needed in the future.
+    db.add_user_role(user_id, role, status="active")
+    session["active_role"] = role
+    session["role"] = role
+
+    return jsonify({
+        "message": f"{role.replace('_', ' ').title()} workspace added successfully.",
+        "roles": db.get_user_roles(user_id),
+        "active_role": role
+    }), 200
+
+
+@auth_bp.route("/api/auth/switch-role", methods=["POST"])
+@login_required
+def switch_workspace_role():
+    user_id = session.get("user_id")
+    data = request.get_json(silent=True) or {}
+    role = str(data.get("role", "")).strip().lower()
+
+    if not role:
+        return jsonify({"error": "Role is required."}), 400
+
+    # Verify that the user has that role active in user_roles
+    if not db.user_has_role(user_id, role):
+        return jsonify({"error": f"You do not have access to the {role} workspace."}), 403
+
+    session["active_role"] = role
+    session["role"] = role
+
+    return jsonify({
+        "message": f"Switched to {role.replace('_', ' ').title()} workspace.",
+        "active_role": role,
+        "roles": db.get_user_roles(user_id)
+    }), 200
 
 
 # ===================================================================
@@ -400,10 +521,16 @@ def admin_verify_otp():
     _clear_failures(email)
     session.clear()
     session["user_id"] = user["id"]
+    session["active_role"] = "super_admin"
     session["role"] = "super_admin"
     session.permanent = True
 
-    return jsonify({"message": "Admin authorization successful!", "user": _safe(user)}), 200
+    return jsonify({
+        "message": "Admin authorization successful!",
+        "user": _safe(user),
+        "roles": [{"role": "super_admin", "status": "active"}],
+        "active_role": "super_admin"
+    }), 200
 
 
 # ===================================================================
@@ -413,14 +540,30 @@ def admin_verify_otp():
 def get_current_user():
     user_id = session.get("user_id")
     if not user_id:
-        return jsonify({"user": None, "authenticated": False}), 200
+        return jsonify({"user": None, "authenticated": False, "roles": [], "active_role": None}), 200
 
     user = db.get_user_by_id(user_id)
     if not user or user.get("status") == "suspended":
         session.clear()
-        return jsonify({"user": None, "authenticated": False}), 200
+        return jsonify({"user": None, "authenticated": False, "roles": [], "active_role": None}), 200
 
-    return jsonify({"user": _safe(user), "authenticated": True}), 200
+    roles = db.get_user_roles(user_id)
+    active_role = session.get("active_role") or session.get("role") or user.get("role")
+
+    # If active_role is not active in user_roles, select first active role
+    if active_role != "super_admin" and not db.user_has_role(user_id, active_role):
+        active_roles = [r["role"] for r in roles if r.get("status") == "active"]
+        if active_roles:
+            active_role = active_roles[0]
+            session["active_role"] = active_role
+            session["role"] = active_role
+
+    return jsonify({
+        "user": _safe(user),
+        "authenticated": True,
+        "roles": roles,
+        "active_role": active_role
+    }), 200
 
 
 @auth_bp.route("/api/auth/logout", methods=["POST"])

@@ -78,9 +78,9 @@ def send_otp():
         # Admin: only whitelisted emails. Same reply either way, so nobody can probe admin emails.
         if email not in Config.ADMIN_EMAILS or (user and user["role"] != "super_admin"):
             return ok_reply
-    elif user and user["role"] != role:
-        label = ROLE_LABELS.get(user["role"], user["role"])
-        return jsonify({"error": f"This email is registered as {label}. Please use that panel."}), 409
+    elif user and not db.user_has_role(user["id"], role):
+        label = ROLE_LABELS.get(user.get("role"), user.get("role", "another role"))
+        return jsonify({"error": f"This email does not have access to the {role} workspace."}), 409
 
     if user and user.get("status") == "suspended":
         return jsonify({"error": "This account has been suspended."}), 403
@@ -149,9 +149,8 @@ def verify_otp():
     user = db.get_user_by_email(email)
     if role == "super_admin" and email not in Config.ADMIN_EMAILS:
         return jsonify({"error": "Access denied."}), 403
-    if user and user["role"] != role:
-        label = ROLE_LABELS.get(user["role"], user["role"])
-        return jsonify({"error": f"This email is registered as {label}. Please use that panel."}), 409
+    if user and not db.user_has_role(user["id"], role):
+        return jsonify({"error": f"This email does not have access to the {role} workspace."}), 409
     if user and user.get("status") == "suspended":
         return jsonify({"error": "This account has been suspended."}), 403
 
@@ -171,9 +170,11 @@ def verify_otp():
             "created_at": now.isoformat(),
         }
         db.create_user(user)
+        db.add_user_role(user["id"], role, status="active")
 
     session.clear()
     session["user_id"] = user["id"]
-    session["role"] = user["role"]
+    session["active_role"] = role
+    session["role"] = role
     session.permanent = True
-    return jsonify({"message": "Login successful!", "user": _safe(user)})
+    return jsonify({"message": "Login successful!", "user": _safe(user), "roles": db.get_user_roles(user["id"]), "active_role": role})

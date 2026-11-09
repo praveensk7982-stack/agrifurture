@@ -8,7 +8,7 @@ from routes.auth_routes import login_required, role_required
 booking_bp = Blueprint("booking_bp", __name__)
 
 @booking_bp.route("/api/bookings", methods=["POST"])
-@login_required
+@role_required("customer", "super_admin")
 def book_machinery():
     data = request.get_json() or {}
     machinery_id = data.get("machinery_id")
@@ -103,20 +103,20 @@ def book_machinery():
 @login_required
 def list_bookings():
     user_id = session.get("user_id")
-    user_role = session.get("role")
-    role_param = request.args.get("role")
+    active_role = session.get("active_role") or session.get("role")
 
-    # Enforce RBAC
-    if role_param and role_param != user_role and user_role != "super_admin":
-        return jsonify({"error": "Forbidden: You cannot view bookings for other roles."}), 403
+    if not active_role:
+        return jsonify({"error": "Forbidden: No active workspace."}), 403
 
-    effective_role = role_param or user_role
-
-    if effective_role == "machinery_seller":
+    if active_role == "machinery_seller":
+        if not db.user_has_role(user_id, "machinery_seller"):
+            return jsonify({"error": "Forbidden: You do not have the machinery seller workspace."}), 403
         bookings = db.get_bookings(seller_id=user_id)
-    elif effective_role == "customer":
+    elif active_role == "customer":
+        if not db.user_has_role(user_id, "customer"):
+            return jsonify({"error": "Forbidden: You do not have the customer workspace."}), 403
         bookings = db.get_bookings(customer_id=user_id)
-    elif effective_role == "super_admin":
+    elif active_role == "super_admin":
         s_id = request.args.get("seller_id")
         c_id = request.args.get("customer_id")
         bookings = db.get_bookings(seller_id=s_id, customer_id=c_id)

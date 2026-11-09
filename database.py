@@ -175,12 +175,33 @@ class Database:
             payment_status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS user_roles (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('customer', 'farmer', 'machinery_seller', 'super_admin')),
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'pending_approval', 'suspended')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, role),
+            FOREIGN KEY(user_id) REFERENCES profiles(id) ON DELETE CASCADE
+        );
         """)
 
         try:
             cur.execute("ALTER TABLE email_otps ADD COLUMN verified INTEGER DEFAULT 0")
         except Exception:
             pass
+
+        # Safe migration / backfill user_roles from profiles
+        try:
+            cur.execute("""
+                INSERT OR IGNORE INTO user_roles (id, user_id, role, status, created_at)
+                SELECT id || '_' || role, id, role, 'active', CURRENT_TIMESTAMP
+                FROM profiles
+                WHERE role IS NOT NULL AND role != ''
+            """)
+        except Exception as e:
+            print(f"[DB] user_roles migration error: {e}")
         
         # Check if profiles table is empty in SQLite; seed only in debug mode
         cur.execute("SELECT COUNT(*) FROM profiles")
@@ -237,6 +258,13 @@ class Database:
         cur.execute("""
         INSERT INTO rental_bookings (id, booking_number, customer_id, machinery_id, seller_id, rental_type, start_datetime, end_datetime, duration_units, rate_applied, with_operator, operator_fee, total_amount, commission_amount, seller_payout, delivery_location, notes, status, payment_status)
         VALUES ('0b111111-1111-1111-1111-111111111111', 'RN-2026-701', '44444444-4444-4444-4444-444444444444', 'f1111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 'hourly', '2026-09-12 09:00:00', '2026-09-12 14:00:00', 5.0, 650.00, 1, 750.00, 4000.00, 400.00, 3600.00, 'Survey Plot 88, Khed Shivapur, Pune', 'Need tractor for pre-monsoon rotavator ploughing.', 'approved', 'paid')
+        """)
+
+        cur.execute("""
+            INSERT OR IGNORE INTO user_roles (id, user_id, role, status, created_at)
+            SELECT id || '_' || role, id, role, 'active', CURRENT_TIMESTAMP
+            FROM profiles
+            WHERE role IS NOT NULL AND role != ''
         """)
 
     # ================== OTP Helper Methods ==================
@@ -554,7 +582,114 @@ class Database:
         conn.execute(f"INSERT INTO profiles ({columns}) VALUES ({placeholders})", [user_data[k] for k in keys])
         conn.commit()
         conn.close()
+
+        if "role" in user_data and user_data["role"]:
+            try:
+                self.add_user_role(user_data["id"], user_data["role"], user_data.get("status", "active"))
+            except Exception as e:
+                print(f"[DB] Initial role insertion warning: {e}")
+
         return user_data
+
+    # ------------------ Multi-Role / Workspaces ------------------
+    def get_user_roles(self, user_id):
+        """
+        Returns list of role dicts for user_id: [{'role': 'customer', 'status': 'active'}, ...]
+        Works in both Supabase and SQLite modes.
+        """
+        if not user_id:
+            return []
+
+        if self.use_supabase and self.client:
+            try:
+                res = self.client.table("user_roles").select("role, status").eq("user_id", user_id).execute()
+                if res.data:
+                    return [{"role": r["role"], "status": r.get("status", "active")} for r in res.data]
+            except Exception as e:
+                print(f"[DB] Supabase error in get_user_roles: {e}")
+                if self.is_vercel:
+                    pass
+
+        conn = self._get_sqlite_conn()
+        rows = conn.execute("SELECT role, status FROM user_roles WHERE user_id = ?", (user_id,)).fetchall()
+        conn.close()
+        if rows:
+            return [{"role": r["role"], "status": r["status"]} for r in rows]
+
+        # Fallback to profiles.role for backward compatibility
+        user = self.get_user_by_id(user_id)
+        if user and user.get("role"):
+            return [{"role": user["role"], "status": user.get("status", "active")}]
+        return []
+
+    def user_has_role(self, user_id, role):
+        """
+        Returns True if user_id has an active role matching 'role'.
+        Works in both Supabase and SQLite modes.
+        """
+        if not user_id or not role:
+            return False
+
+        if self.use_supabase and self.client:
+            try:
+                res = self.client.table("user_roles").select("role").eq("user_id", user_id).eq("role", role).eq("status", "active").execute()
+                if res.data and len(res.data) > 0:
+                    return True
+            except Exception as e:
+                print(f"[DB] Supabase error in user_has_role: {e}")
+                if self.is_vercel:
+                    pass
+
+        conn = self._get_sqlite_conn()
+        row = conn.execute(
+            "SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND status = 'active'",
+            (user_id, role)
+        ).fetchone()
+        conn.close()
+        if row:
+            return True
+
+        # Fallback to profiles.role for backward compatibility
+        user = self.get_user_by_id(user_id)
+        if user and user.get("role") == role and user.get("status") == "active":
+            return True
+        return False
+
+    def add_user_role(self, user_id, role, status="active"):
+        """
+        Adds or updates a workspace role for user_id.
+        Works in both Supabase and SQLite modes.
+        """
+        if not user_id or not role:
+            return False
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        payload = {
+            "user_id": user_id,
+            "role": role,
+            "status": status,
+            "created_at": now_iso
+        }
+
+        if self.use_supabase and self.client:
+            try:
+                self.client.table("user_roles").upsert(payload, on_conflict="user_id,role").execute()
+                return True
+            except Exception as e:
+                print(f"[DB] Supabase add_user_role error: {e}")
+                if self.is_vercel:
+                    raise e
+
+        conn = self._get_sqlite_conn()
+        role_id = f"{user_id}_{role}"
+        conn.execute("""
+            INSERT INTO user_roles (id, user_id, role, status, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, role) DO UPDATE SET status = excluded.status
+        """, (role_id, user_id, role, status, now_iso))
+        conn.commit()
+        conn.close()
+        return True
 
     def get_all_users(self, role=None):
         if self.use_supabase:

@@ -32,7 +32,13 @@ const API = {
       }
       if (!response.ok) {
         const msg = (typeof data.error === 'string' ? data.error : data.error?.message) || data.message || response.statusText || `HTTP error ${response.status}`;
-        throw new Error(msg);
+        const err = new Error(msg);
+        err.status = response.status;
+        err.code = data.code;
+        err.roles = data.roles;
+        err.requested_role = data.requested_role;
+        err.data = data;
+        throw err;
       }
       return data;
     } catch (err) {
@@ -101,6 +107,18 @@ const API = {
       return API.request("/api/auth/forgot-password/reset", {
         method: "POST",
         body: data
+      });
+    },
+    switchRole(role) {
+      return API.request("/api/auth/switch-role", {
+        method: "POST",
+        body: { role }
+      });
+    },
+    addRole(role, password) {
+      return API.request("/api/auth/roles/add", {
+        method: "POST",
+        body: { role, password }
       });
     }
   },
