@@ -686,28 +686,28 @@ class Database:
         if not user_id or not role:
             return False
 
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        role_id = f"{user_id}_{role}"
-        payload = {
-            "id": role_id,
-            "user_id": str(user_id),
-            "role": role,
-            "status": status,
-            "created_at": now_iso
-        }
-
         if self.use_supabase:
+            payload = {
+                "user_id": str(user_id),
+                "role": role,
+                "status": status
+            }
             try:
                 res = self.client.table("user_roles").upsert(payload, on_conflict="user_id,role").execute()
                 if res.data and len(res.data) > 0:
                     return res.data[0]
                 return payload
             except Exception as e:
+                err_str = str(e).lower()
+                if "duplicate" in err_str or "23505" in err_str or "conflict" in err_str:
+                    return payload
                 print(f"[DB] Supabase add_user_role error: {e}")
                 if self.is_vercel:
                     raise e
                 return payload
         else:
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            role_id = f"{user_id}_{role}"
             conn = self._get_sqlite_conn()
             conn.execute("""
                 INSERT INTO user_roles (id, user_id, role, status, created_at)
@@ -716,7 +716,13 @@ class Database:
             """, (role_id, str(user_id), role, status, now_iso))
             conn.commit()
             conn.close()
-            return payload
+            return {
+                "id": role_id,
+                "user_id": str(user_id),
+                "role": role,
+                "status": status,
+                "created_at": now_iso
+            }
 
     def get_all_users(self, role=None):
         if self.use_supabase:
