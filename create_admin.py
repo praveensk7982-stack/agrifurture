@@ -89,8 +89,8 @@ def main():
         sys.exit(1)
 
     try:
-        password = getpass.getpass("Enter admin password: ")
-        confirm_pwd = getpass.getpass("Confirm admin password: ")
+        password = input("Enter admin password: ");
+        confirm_pwd = input("Confirm admin password: ")
     except (KeyboardInterrupt, EOFError):
         print("\nAborted.")
         sys.exit(0)
